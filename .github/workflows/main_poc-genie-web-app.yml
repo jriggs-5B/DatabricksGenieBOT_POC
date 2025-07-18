@@ -77,3 +77,10 @@ jobs:
           package: release.zip
           clean: true               # ← delete all files under wwwroot before deploy
           enable-oryx-build: false
+
+          startup-command: > 
+            gunicorn  --bind=0.0.0.0:8000 \
+              --worker-class aiohttp.worker.GunicornWebWorker \
+              --timeout 1200 \
+              app:app
+
