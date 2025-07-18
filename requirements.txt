@@ -18,10 +18,10 @@ databricks-sdk==0.58.0
 databricks-genai
 
 # Web server
-gunicorn==20.1.0
+gunicorn==23.0.0
 
 # (Optionally) CORS if you use it
 flask-cors==6.0.1   # only if you have a Flask route that needs cross-origin
 
 # (Optionally) Flask if you have any Flask endpoints
-flask==3.1.1        # if you’re actually using Flask anywhere
+flask==3.1.0        # if you’re actually using Flask anywhere
