@@ -36,7 +36,6 @@ jobs:
 
       - name: Zip artifact for deployment
         run: zip -r release.zip . \
-              -x ".venv/*" \
               -x ".git/*" \
               -x "__pycache__/*" \
               -x "*.pyc" \
