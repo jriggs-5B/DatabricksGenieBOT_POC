@@ -1,0 +1,36 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "377f4ccd-e32a-4aba-bc12-2e5fade90b1f",
+  "packageName": "com.example.geniebot",
+  "developer": {
+    "name": "Five Below",
+    "websiteUrl": "https://github.com/jriggs-5B/DatabricksGenieBOT_POC/blob/main/README.md",
+    "privacyUrl": "https://github.com/jriggs-5B/DatabricksGenieBOT_POC/blob/main/privacy.md",
+    "termsOfUseUrl": "https://github.com/jriggs-5B/DatabricksGenieBOT_POC/blob/main/terms.md"
+  },
+  "name": {
+    "short": "Supply Chain KNOWLEDGE Genie",
+    "full": "Supply Chain KNOWLEDGE Genie"
+  },
+  "description": {
+    "short": "Ask Genie questions about the inbound visibility dataset",
+    "full": "A Teams bot powered by Databricks Genie for questions about the inbound visibility dataset"
+  },
+  "icons": {
+    "outline": "outline.png",
+    "color": "color.png"
+  },
+  "accentColor": "#004578",
+  "bots": [
+    {
+      "botId": "377f4ccd-e32a-4aba-bc12-2e5fade90b1f",
+      "scopes": ["personal","team","groupchat"],
+      "supportsFiles": false,
+      "isNotificationOnly": false
+    }
+  ],
+  "permissions": ["identity","messageTeamMembers"],
+  "validDomains": ["poc-genie-web-app-hwerdjfpauehcxa4.eastus-01.azurewebsites.net"]
+}
