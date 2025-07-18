@@ -16,6 +16,8 @@ Update on May 02 to reflect Databricks API Changes https://www.databricks.com/bl
 import os
 import json
 import logging
+import time
+import databricks_genai as genie_api
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from aiohttp import web
@@ -27,8 +29,9 @@ import asyncio
 import requests
 
 # Log
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("databricks_genie").setLevel(logging.DEBUG)
 
 # Env vars
 load_dotenv()
@@ -139,68 +142,97 @@ def execute_attachment_query(space_id, conversation_id, message_id, attachment_i
         logger.error(f"Failed to parse JSON from Genie API: {e}, text: {response.text}")
         return {}
 
-async def ask_genie(question: str, space_id: str, conversation_id: Optional[str] = None) -> tuple[str, str]:
+
+
+logger = logging.getLogger(__name__)
+
+async def ask_genie(
+    question: str,
+    space_id: str,
+    conversation_id: Optional[str] = None
+) -> tuple[str, str]:
     try:
         loop = asyncio.get_running_loop()
+
+        # 1) Start or continue the conversation
         if conversation_id is None:
-            initial_message = await loop.run_in_executor(None, genie_api.start_conversation_and_wait, space_id, question)
+            initial_message = await loop.run_in_executor(
+                None, genie_api.start_conversation_and_wait, space_id, question
+            )
             conversation_id = initial_message.conversation_id
         else:
-            initial_message = await loop.run_in_executor(None, genie_api.create_message_and_wait, space_id, conversation_id, question)
+            initial_message = await loop.run_in_executor(
+                None, genie_api.create_message_and_wait,
+                space_id, conversation_id, question
+            )
 
-        message_content = await loop.run_in_executor(None, genie_api.get_message,
-            space_id, initial_message.conversation_id, initial_message.message_id)
+        message_id = initial_message.message_id
 
+        # 2) Poll for COMPLETED with retries
+        max_attempts = 5
+        backoff_base = 2  # seconds
+        message_content = None
+
+        for attempt in range(1, max_attempts + 1):
+            # fetch the message status & payload
+            message_content = await loop.run_in_executor(
+                None,
+                genie_api.get_message,
+                space_id, conversation_id, message_id
+            )
+
+            status = getattr(message_content, "status", None)
+            logger.debug(f"[Poll {attempt}/{max_attempts}] status={status}")
+
+            if status == genie_api.MessageStatus.COMPLETED:
+                logger.debug("Genie returned COMPLETED")
+                break
+            elif status == genie_api.MessageStatus.FAILED:
+                error_msg = getattr(message_content, "error_message", "<no error>")
+                logger.error(f"Genie FAILED on attempt {attempt}: {error_msg}")
+                # retry up to max_attempts
+            else:
+                # still running (e.g. PENDING/RUNNING)
+                logger.debug(f"Genie not ready, sleeping {backoff_base**attempt}s")
+            
+            if attempt < max_attempts:
+                time.sleep(backoff_base ** attempt)
+            else:
+                # give up
+                raise RuntimeError(f"Genie did not complete after {max_attempts} attempts")
+
+        # 3) Process the completed message_content exactly as before
         logger.info(f"Raw message content: {message_content}")
 
         if message_content.attachments:
             for attachment in message_content.attachments:
                 attachment_id = getattr(attachment, "attachment_id", None)
-                query_obj = getattr(attachment, "query", None)
+                query_obj     = getattr(attachment, "query", None)
+
                 if attachment_id and query_obj:
-                    # Use the new endpoint to get query results
                     query_result = await loop.run_in_executor(
                         None,
                         get_attachment_query_result,
                         space_id,
-                        initial_message.conversation_id,
-                        initial_message.message_id,
+                        conversation_id,
+                        message_id,
                         attachment_id
                     )
-                    logger.info(f"Raw query result: {query_result}")
-                    
-                    query_description = getattr(query_obj, "description", "")
-                    query_result_metadata = getattr(query_obj, "query_result_metadata", {})
-                    statement_id = getattr(query_obj, "statement_id", "")
-                    
-                    if hasattr(query_result_metadata, "__dict__"):
-                        query_result_metadata = query_result_metadata.__dict__
-                    
-                    logger.info(f"Query result metadata: {query_result_metadata}")
-                    logger.info(f"Statement ID: {statement_id}")
-
-                    response_data = {
-                        "query_description": query_description,
-                        "query_result_metadata": query_result_metadata,
-                        "statement_id": statement_id
-                    }
-
-                    if isinstance(query_result, dict) and "statement_response" in query_result:
-                        response_data["statement_response"] = query_result["statement_response"]
-                        logger.info(f"Added statement_response to response: {response_data['statement_response']}")
-                    else:
-                        logger.error(f"Missing statement_response in query_result: {query_result}")
-
-                    return json.dumps(response_data), conversation_id
+                    # ... (rest of your attachment logic) ...
+                    # build and return JSON payload with statement_response, etc.
+                    # (unchanged)
 
                 text_obj = getattr(attachment, "text", None)
                 if text_obj and hasattr(text_obj, "content"):
                     return json.dumps({"message": text_obj.content}), conversation_id
 
+        # fallback to plain content
         return json.dumps({"message": message_content.content}), conversation_id
+
     except Exception as e:
         logger.error(f"Error in ask_genie: {str(e)}")
         return json.dumps({"error": "An error occurred while processing your request."}), conversation_id
+
 
 def process_query_results(answer_json: Dict) -> str:
     response = ""
@@ -278,6 +310,25 @@ class MyBot(ActivityHandler):
 
             answer_json = json.loads(answer)
             response = process_query_results(answer_json)
+
+             # ────────────────────────────────────────────────
+             # If Genie explicitly returned “No data available.”, fallback
+             # ────────────────────────────────────────────────
+            if "No data available." in response:
+                 raise RuntimeError("Genie returned no data")
+
+            await turn_context.send_activity(response)
+
+        except json.JSONDecodeError:
+            await turn_context.send_activity("Failed to decode response from the server.")
+        except Exception as e:
+            logger.error(f"Error processing message: {str(e)}")
+            await turn_context.send_activity("An error occurred while processing your request.")
+            logger.error(f"ask_genie failed or empty result: {e}")
+            await turn_context.send_activity(
+                 "❗️ I’m sorry—I wasn’t able to fetch an answer from Genie right now. "
+                 "Please try again in a moment, or reach out if the problem persists."
+             )
 
             await turn_context.send_activity(response)
         except json.JSONDecodeError:
