@@ -30,8 +30,8 @@ jobs:
         uses: docker/build-push-action@v4
         with:
           context: .
-          push: true
-            docker.io/${{ secrets.DOCKERHUB_USER }}/poc-genie-web-app:${{ github.sha }}
+          push: "true"
+          tags: docker.io/${{ secrets.DOCKERHUB_USER }}/poc-genie-web-app:${{ github.sha }}
 
   # ────────────────────────────────────────────────────────────────────────────
   # 2) Deploy that image to your existing App Service
