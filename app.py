@@ -17,10 +17,11 @@ import os
 import json
 import logging
 import time
-import databricks_genai as genie_api
+import databricks_genai as genai
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from aiohttp import web
+from databricks_genai import MessageStatus
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, ActivityHandler, TurnContext
 from botbuilder.schema import Activity, ChannelAccount
 from databricks.sdk import WorkspaceClient
@@ -47,7 +48,9 @@ workspace_client = WorkspaceClient(
     token=DATABRICKS_TOKEN
 )
 
-genie_api = GenieAPI(workspace_client.api_client)
+dash_genie = GenieAPI(workspace_client.api_client)
+
+genie_api = genai
 
 def get_attachment_query_result(space_id, conversation_id, message_id, attachment_id):
     url = f"{DATABRICKS_HOST}/api/2.0/genie/spaces/{space_id}/conversations/{conversation_id}/messages/{message_id}"
@@ -184,10 +187,10 @@ async def ask_genie(
             status = getattr(message_content, "status", None)
             logger.debug(f"[Poll {attempt}/{max_attempts}] status={status}")
 
-            if status == genie_api.MessageStatus.COMPLETED:
+            if status == MessageStatus.COMPLETED:
                 logger.debug("Genie returned COMPLETED")
                 break
-            elif status == genie_api.MessageStatus.FAILED:
+            elif status == MessageStatus.FAILED:
                 error_msg = getattr(message_content, "error_message", "<no error>")
                 logger.error(f"Genie FAILED on attempt {attempt}: {error_msg}")
                 # retry up to max_attempts
