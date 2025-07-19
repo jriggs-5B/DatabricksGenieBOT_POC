@@ -43,5 +43,5 @@ jobs:
         with:
           app-name: "POC-genie-web-app"
           slot-name: "Production"
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_… }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_EB7A030785BB4A8DBFC44036C84F6519 }}
           package: release.zip
