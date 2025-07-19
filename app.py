@@ -21,7 +21,6 @@ import databricks_genai as genai
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from aiohttp import web
-from databricks_genai import MessageStatus
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, ActivityHandler, TurnContext
 from botbuilder.schema import Activity, ChannelAccount
 from databricks.sdk import WorkspaceClient
@@ -187,10 +186,10 @@ async def ask_genie(
             status = getattr(message_content, "status", None)
             logger.debug(f"[Poll {attempt}/{max_attempts}] status={status}")
 
-            if status == MessageStatus.COMPLETED:
+            if status == "COMPLETED":
                 logger.debug("Genie returned COMPLETED")
                 break
-            elif status == MessageStatus.FAILED:
+            elif status == "FAILED":
                 error_msg = getattr(message_content, "error_message", "<no error>")
                 logger.error(f"Genie FAILED on attempt {attempt}: {error_msg}")
                 # retry up to max_attempts
