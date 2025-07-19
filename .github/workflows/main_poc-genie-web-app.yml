@@ -34,6 +34,7 @@ jobs:
             -x "__pycache__/*" \
             -x "*.pyc" \
             -x "venv/*" \
+            -x ".venv/*" \
             -x ".env*" \
             -x "docs/*" \
             -x "tests/*"
