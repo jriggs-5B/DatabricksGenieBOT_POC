@@ -15,8 +15,8 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY . .
 
 # 5. Tell Docker (and any tools) that we listen on 8000 by default
-ENV PORT=8000
-EXPOSE 8000
+ENV PORT=8181
+EXPOSE 8181
 
 # Run via shell so $PORT expands
 CMD \
