@@ -17,7 +17,6 @@ import os
 import json
 import logging
 import time
-import databricks_genai as genai
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from aiohttp import web
@@ -47,9 +46,7 @@ workspace_client = WorkspaceClient(
     token=DATABRICKS_TOKEN
 )
 
-dash_genie = GenieAPI(workspace_client.api_client)
-
-genie_api = genai
+genie_api = GenieAPI(workspace_client.api_client)
 
 def get_attachment_query_result(space_id, conversation_id, message_id, attachment_id):
     url = f"{DATABRICKS_HOST}/api/2.0/genie/spaces/{space_id}/conversations/{conversation_id}/messages/{message_id}"
