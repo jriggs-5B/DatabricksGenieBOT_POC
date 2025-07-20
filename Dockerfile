@@ -32,4 +32,6 @@ CMD \
     --bind=0.0.0.0:$PORT \
     --worker-class aiohttp.worker.GunicornWebWorker \
     --timeout 1200 \
+    --access-logfile - \
+    --error-logfile - \
     app:app
