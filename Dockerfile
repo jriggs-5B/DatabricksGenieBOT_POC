@@ -8,6 +8,13 @@ WORKDIR /app
 
 # 3. Copy requirements and install them
 COPY requirements.txt .
+# Debug: show the file and Python version
+RUN echo "=== requirements.txt ===" \
+    && cat requirements.txt \
+    && echo "=== python & pip versions ===" \
+    && python --version \
+    && pip --version
+
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
