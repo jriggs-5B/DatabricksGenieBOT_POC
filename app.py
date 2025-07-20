@@ -27,10 +27,26 @@ from databricks.sdk.service.dashboards import GenieAPI
 import asyncio
 import requests
 
-# Log
-logging.basicConfig(level=logging.INFO)
+# Log for prod
+# logging.basicConfig(level=logging.INFO)
+# logger = logging.getLogger(__name__)
+# logging.getLogger("databricks_genie").setLevel(logging.DEBUG)
+
+#Log for development
+# 1) Enable DEBUG everywhere (you can narrow this later)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
+
+# 2) Your module logger
 logger = logging.getLogger(__name__)
-logging.getLogger("databricks_genie").setLevel(logging.DEBUG)
+logger.setLevel(logging.DEBUG)
+
+# 3) Turn on the Databricks SDK + HTTP internals
+logging.getLogger("databricks").setLevel(logging.DEBUG)
+logging.getLogger("databricks.sdk").setLevel(logging.DEBUG)
+logging.getLogger("urllib3").setLevel(logging.DEBUG)
 
 # Env vars
 load_dotenv()
@@ -205,6 +221,10 @@ async def ask_genie(
 
         if message_content.attachments:
             for attachment in message_content.attachments:
+                text_obj = getattr(attachment, "text", None)
+                if text_obj and hasattr(text_obj, "content"):
+                    return json.dumps({"message": text_obj.content}), conversation_id
+            
                 attachment_id = getattr(attachment, "attachment_id", None)
                 query_obj     = getattr(attachment, "query", None)
 
