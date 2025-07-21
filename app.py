@@ -238,21 +238,14 @@ async def ask_genie(
         logger.info(f"Raw message content: {message_content}")
 
         # ───────────────────────────────────────────────────────────────────
-        # FIRST: if the assistant returned any plain-text reply, send that
-        if getattr(message_content, "content", None):
-            logger.debug(f"🔥 RETURNING CONTENT: {message_content.content}")
-            return json.dumps({"message": message_content.content}), conversation_id
-        # ───────────────────────────────────────────────────────────────────
-
-        # SECOND: if there are attachments (e.g. SQL cards), handle those
+        # FIRST: if there are Genie “attachment” cards (e.g. SQL results), send those
         if message_content.attachments:
-            logger.debug(f"🔥 RETURNING CONTENT: {message_content.content}")
             for attachment in message_content.attachments:
                 attachment_id = getattr(attachment, "attachment_id", None)
                 query_obj     = getattr(attachment, "query", None)
 
                 if attachment_id and query_obj:
-                    # fetch the actual query result
+                    logger.debug(f"🔍 Found attachment {attachment_id}, fetching result")
                     query_result = await loop.run_in_executor(
                         None,
                         get_attachment_query_result,
@@ -261,11 +254,16 @@ async def ask_genie(
                         message_id,
                         attachment_id
                     )
-                    # return the JSON you built up in that helper
                     return json.dumps(query_result), conversation_id
 
-        # THIRD: if we got here, neither plain text nor attachments yielded an answer
-        logger.debug(f"🔥 RETURNING CONTENT: {message_content.content}")
+        # ───────────────────────────────────────────────────────────────────
+        # NEXT: if Genie gave a plain‑text reply (i.e. a “text” message), send that
+        if getattr(message_content, "content", None):
+            logger.debug(f"💬 Returning plain text: {message_content.content}")
+            return json.dumps({"message": message_content.content}), conversation_id
+
+        # ───────────────────────────────────────────────────────────────────
+        # FINAL fallback
         return json.dumps({"error": "No data available."}), conversation_id
 
         # # 4) Handle SDK object with `.content` attribute
