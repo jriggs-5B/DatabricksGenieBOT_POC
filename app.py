@@ -23,7 +23,7 @@ from aiohttp import web
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, ActivityHandler, TurnContext
 from botbuilder.schema import Activity, ChannelAccount
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.dashboards import GenieAPI
+from databricks.sdk.service.dashboards import GenieAPI, MessageStatus
 import asyncio
 import requests
 
@@ -207,21 +207,20 @@ async def ask_genie(
             status = getattr(message_content, "status", None)
             logger.debug(f"[Poll {attempt}/{max_attempts}] status={status}")
 
-            if status == "COMPLETED":
+            if status == MessageStatus.COMPLETED:
                 logger.debug("Genie returned COMPLETED")
                 break
-            elif status == "FAILED":
+
+            if status == MessageStatus.FAILED:
                 error_msg = getattr(message_content, "error_message", "<no error>")
                 logger.error(f"Genie FAILED on attempt {attempt}: {error_msg}")
-                # retry up to max_attempts
+
             else:
-                # still running (e.g. PENDING/RUNNING)
-                logger.debug(f"Genie not ready, sleeping {backoff_base**attempt}s")
-            
+                logger.debug(f"Genie not ready, sleeping {backoff_base ** attempt}s")
+
             if attempt < max_attempts:
                 time.sleep(backoff_base ** attempt)
             else:
-                # give up
                 raise RuntimeError(f"Genie did not complete after {max_attempts} attempts")
 
         # 3) Process the completed message_content exactly as before
@@ -230,7 +229,12 @@ async def ask_genie(
         if message_content.attachments:
             for attachment in message_content.attachments:
                 text_obj = getattr(attachment, "text", None)
-                if text_obj and hasattr(text_obj, "content"):
+
+                if isinstance(text_obj, dict) and "content" in text_obj:
+                    return json.dumps({"message": text_obj["content"]}), conversation_id
+
+                # 2) Handle SDK object with `.content` attribute
+                if hasattr(text_obj, "content"):
                     return json.dumps({"message": text_obj.content}), conversation_id
             
                 attachment_id = getattr(attachment, "attachment_id", None)
