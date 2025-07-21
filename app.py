@@ -61,6 +61,14 @@ workspace_client = WorkspaceClient(
     host=DATABRICKS_HOST,
     token=DATABRICKS_TOKEN
 )
+# 1) Create your aiohttp app
+app = web.Application()
+
+# 2) Register healthz **before** all your other routes
+async def healthz(request):
+    return web.Response(status=200)
+
+app.router.add_get("/healthz", healthz)
 
 genie_api = GenieAPI(workspace_client.api_client)
 
