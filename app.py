@@ -237,15 +237,23 @@ async def ask_genie(
         # 3) Process the completed message_content exactly as before
         logger.info(f"Raw message content: {message_content}")
 
-        # ───────────────────────────────────────────────────────────────────
-        # FIRST: if there are Genie “attachment” cards (e.g. SQL results), send those
+       
+                # 3) Process the completed message_content
+        logger.info(f"Raw message content: {message_content}")
+
+        # FIRST: if there are attachments, prefer those
         if message_content.attachments:
             for attachment in message_content.attachments:
+                # 3a) A plain‑text attachment (e.g. “I retrieved the data….”)
+                text_obj = getattr(attachment, "text", None)
+                if text_obj and hasattr(text_obj, "content"):
+                    # return exactly what Genie’s .text.content says
+                    return json.dumps({"message": text_obj.content}), conversation_id
+
+                # 3b) A SQL card attachment
                 attachment_id = getattr(attachment, "attachment_id", None)
                 query_obj     = getattr(attachment, "query", None)
-
                 if attachment_id and query_obj:
-                    logger.debug(f"🔍 Found attachment {attachment_id}, fetching result")
                     query_result = await loop.run_in_executor(
                         None,
                         get_attachment_query_result,
@@ -256,15 +264,9 @@ async def ask_genie(
                     )
                     return json.dumps(query_result), conversation_id
 
-        # ───────────────────────────────────────────────────────────────────
-        # NEXT: if Genie gave a plain‑text reply (i.e. a “text” message), send that
-        if getattr(message_content, "content", None):
-            logger.debug(f"💬 Returning plain text: {message_content.content}")
-            return json.dumps({"message": message_content.content}), conversation_id
-
-        # ───────────────────────────────────────────────────────────────────
-        # FINAL fallback
+        # THIRD: nothing meaningful found → error fallback
         return json.dumps({"error": "No data available."}), conversation_id
+
 
         # # 4) Handle SDK object with `.content` attribute
         # if hasattr(text_obj, "content"):
