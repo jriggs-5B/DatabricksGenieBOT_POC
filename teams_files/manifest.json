@@ -1,6 +1,6 @@
 {
-  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.11/MicrosoftTeams.schema.json",
-  "manifestVersion": "1.11",
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
   "version": "1.0.1",
   "id": "377f4ccd-e32a-4aba-bc12-2e5fade90b1f",
   "packageName": "com.example.geniebot",
@@ -28,9 +28,8 @@
       "botId": "377f4ccd-e32a-4aba-bc12-2e5fade90b1f",
       "scopes": ["personal","team","groupchat"],
       "supportsFiles": false,
-      "isNotificationOnly": false,
-      "displayName": "Supply Chain KNOWLEDGE Genie",
-      "description": "Ask Genie questions about the inbound visibility dataset"
+      "isNotificationOnly": false
+      
     }
   ],
   "permissions": ["identity","messageTeamMembers"],
