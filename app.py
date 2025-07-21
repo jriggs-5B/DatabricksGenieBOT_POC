@@ -174,6 +174,7 @@ async def ask_genie(
     space_id: str,
     conversation_id: Optional[str] = None
 ) -> tuple[str, str]:
+    logger.debug("🔥 ENTERING ask_genie v2! 🔥")
     try:
         loop = asyncio.get_running_loop()
 
@@ -223,24 +224,35 @@ async def ask_genie(
             else:
                 raise RuntimeError(f"Genie did not complete after {max_attempts} attempts")
 
+        # # 3) Process the completed message_content exactly as before
+        # logger.info(f"Raw message content: {message_content}")
+
+        # if message_content.attachments:
+        #     for attachment in message_content.attachments:
+        #         text_obj = getattr(attachment, "text", None)
+
+        #         if isinstance(text_obj, dict) and "content" in text_obj:
+        #             return json.dumps({"message": text_obj["content"]}), conversation_id
+
         # 3) Process the completed message_content exactly as before
         logger.info(f"Raw message content: {message_content}")
 
+        # ───────────────────────────────────────────────────────────────────
+        # FIRST: if the assistant returned any plain-text reply, send that
+        if getattr(message_content, "content", None):
+            logger.debug(f"🔥 RETURNING CONTENT: {message_content.content}")
+            return json.dumps({"message": message_content.content}), conversation_id
+        # ───────────────────────────────────────────────────────────────────
+
+        # SECOND: if there are attachments (e.g. SQL cards), handle those
         if message_content.attachments:
+            logger.debug(f"🔥 RETURNING CONTENT: {message_content.content}")
             for attachment in message_content.attachments:
-                text_obj = getattr(attachment, "text", None)
-
-                if isinstance(text_obj, dict) and "content" in text_obj:
-                    return json.dumps({"message": text_obj["content"]}), conversation_id
-
-                # 2) Handle SDK object with `.content` attribute
-                if hasattr(text_obj, "content"):
-                    return json.dumps({"message": text_obj.content}), conversation_id
-            
                 attachment_id = getattr(attachment, "attachment_id", None)
                 query_obj     = getattr(attachment, "query", None)
 
                 if attachment_id and query_obj:
+                    # fetch the actual query result
                     query_result = await loop.run_in_executor(
                         None,
                         get_attachment_query_result,
@@ -249,16 +261,39 @@ async def ask_genie(
                         message_id,
                         attachment_id
                     )
-                    # ... (rest of your attachment logic) ...
-                    # build and return JSON payload with statement_response, etc.
-                    # (unchanged)
+                    # return the JSON you built up in that helper
+                    return json.dumps(query_result), conversation_id
 
-                text_obj = getattr(attachment, "text", None)
-                if text_obj and hasattr(text_obj, "content"):
-                    return json.dumps({"message": text_obj.content}), conversation_id
+        # THIRD: if we got here, neither plain text nor attachments yielded an answer
+        logger.debug(f"🔥 RETURNING CONTENT: {message_content.content}")
+        return json.dumps({"error": "No data available."}), conversation_id
 
-        # fallback to plain content
-        return json.dumps({"message": message_content.content}), conversation_id
+        # # 4) Handle SDK object with `.content` attribute
+        # if hasattr(text_obj, "content"):
+        #             return json.dumps({"message": text_obj.content}), conversation_id
+            
+        # attachment_id = getattr(attachment, "attachment_id", None)
+        # query_obj     = getattr(attachment, "query", None)
+
+        # if attachment_id and query_obj:
+        #             query_result = await loop.run_in_executor(
+        #                 None,
+        #                 get_attachment_query_result,
+        #                 space_id,
+        #                 conversation_id,
+        #                 message_id,
+        #                 attachment_id
+        #             )
+        #             # ... (rest of your attachment logic) ...
+        #             # build and return JSON payload with statement_response, etc.
+        #             # (unchanged)
+
+        # text_obj = getattr(attachment, "text", None)
+        # if text_obj and hasattr(text_obj, "content"):
+        #             return json.dumps({"message": text_obj.content}), conversation_id
+
+        # # fallback to plain content
+        # return json.dumps({"message": message_content.content}), conversation_id
 
     except Exception as e:
         logger.error(f"Error in ask_genie: {str(e)}")
