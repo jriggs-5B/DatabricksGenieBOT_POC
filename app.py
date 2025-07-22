@@ -374,33 +374,39 @@ class MyBot(ActivityHandler):
         self.conversation_ids: Dict[str, str] = {}
 
     async def on_message_activity(self, turn_context: TurnContext):
-        question = turn_context.activity.text
         user_id = turn_context.activity.from_property.id
-        conversation_id = self.conversation_ids.get(user_id)
+        question = turn_context.activity.text
 
         try:
-            answer, new_conversation_id = await ask_genie(question, DATABRICKS_SPACE_ID, conversation_id)
+            # 1) call Genie
+            answer, new_conversation_id = await ask_genie(
+                question,
+                DATABRICKS_SPACE_ID,
+                self.conversation_ids.get(user_id),
+            )
             self.conversation_ids[user_id] = new_conversation_id
 
+            # 2) parse & render
             answer_json = json.loads(answer)
-            response = process_query_results(answer_json)
+            response    = process_query_results(answer_json)
 
-             # ────────────────────────────────────────────────
-             # If Genie explicitly returned “No data available.”, fallback
-             # ────────────────────────────────────────────────
-            if "No data available." in response:
-                 raise RuntimeError("Genie returned no data")
-
+            # 3) send it once
+            logger.info(f"Sending response: {response!r}")
             await turn_context.send_activity(response)
 
-        except json.JSONDecodeError:
-            await turn_context.send_activity("Failed to decode response from the server.")
-        except Exception as e:
-            logger.error(f"Error processing message: {str(e)}")
+        except json.JSONDecodeError as jde:
+            logger.exception("Failed to parse JSON from Genie")
             await turn_context.send_activity(
-                 "❗️ I’m sorry—I wasn’t able to fetch an answer from Genie right now. "
-                 "Please try again in a moment, or reach out if the problem persists."
-             )
+                "⚠️ I got something I couldn’t understand back from Genie."
+            )
+
+        except Exception as e:
+            # **this will now log the full stacktrace to your container logs**
+            logger.exception("Unhandled error in on_message_activity")
+            await turn_context.send_activity(
+                "❗️ I’m sorry—I ran into an unexpected error processing your request. "
+                "Please try again in a moment."
+            )
 
     async def on_members_added_activity(self, members_added: List[ChannelAccount], turn_context: TurnContext):
         for member in members_added:
