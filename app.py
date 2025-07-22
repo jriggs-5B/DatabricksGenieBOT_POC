@@ -253,6 +253,8 @@ async def ask_genie(
                         attachment_id
                     )
 
+                    logger.debug(f"Fetched query_result: {query_result!r}")
+
                     # collapse the SQL into <details> if we got raw_sql
                     sql_block = ""
                     if raw_sql:
