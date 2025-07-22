@@ -262,38 +262,37 @@ async def ask_genie(
                         message_id,
                         attachment_id
                     )
+
+                    # 2) pull description & raw SQL from the SDK attachment object
+                    desc    = getattr(query_obj, "description", None)
+                    raw_sql = getattr(query_obj, "query", None)
+
+                    # 3) decorate your JSON however you like—in Teams you can even
+                    #    render the SQL in a collapsed `<details>` block:
+                    markdown_sql = (
+                        "<details>\n"
+                        "  <summary><b>View generated SQL</b></summary>\n\n"
+                        "```sql\n"
+                        f"{raw_sql}\n"
+                        "```\n"
+                        "</details>"
+                    ) if raw_sql else None
+
+                    payload = {
+                        "description": desc,
+                        "results": query_result,    # whatever shape your helper returns
+                    }
+                    if markdown_sql:
+                        payload["sql"] = markdown_sql
+
+                    return json.dumps(payload), conversation_id
+
+
                     return json.dumps(query_result), conversation_id
 
         # THIRD: nothing meaningful found → error fallback
         return json.dumps({"error": "No data available."}), conversation_id
 
-
-        # # 4) Handle SDK object with `.content` attribute
-        # if hasattr(text_obj, "content"):
-        #             return json.dumps({"message": text_obj.content}), conversation_id
-            
-        # attachment_id = getattr(attachment, "attachment_id", None)
-        # query_obj     = getattr(attachment, "query", None)
-
-        # if attachment_id and query_obj:
-        #             query_result = await loop.run_in_executor(
-        #                 None,
-        #                 get_attachment_query_result,
-        #                 space_id,
-        #                 conversation_id,
-        #                 message_id,
-        #                 attachment_id
-        #             )
-        #             # ... (rest of your attachment logic) ...
-        #             # build and return JSON payload with statement_response, etc.
-        #             # (unchanged)
-
-        # text_obj = getattr(attachment, "text", None)
-        # if text_obj and hasattr(text_obj, "content"):
-        #             return json.dumps({"message": text_obj.content}), conversation_id
-
-        # # fallback to plain content
-        # return json.dumps({"message": message_content.content}), conversation_id
 
     except Exception as e:
         logger.error(f"Error in ask_genie: {str(e)}")
@@ -301,61 +300,85 @@ async def ask_genie(
 
 
 def process_query_results(answer_json: Dict) -> str:
-    response = ""
-    
+    sections: List[str] = []
     logger.info(f"Processing answer JSON: {answer_json}")
-    
-    if "query_description" in answer_json and answer_json["query_description"]:
-        response += f"## Query Description\n\n{answer_json['query_description']}\n\n"
 
-    if "query_result_metadata" in answer_json:
-        metadata = answer_json["query_result_metadata"]
-        if isinstance(metadata, dict):
-            if "row_count" in metadata:
-                response += f"**Row Count:** {metadata['row_count']}\n\n"
-            if "execution_time_ms" in metadata:
-                response += f"**Execution Time:** {metadata['execution_time_ms']}ms\n\n"
+    # ─────────────────────────────────────────────
+    # 1) Query Description (if provided)
+    # ─────────────────────────────────────────────
+    desc = answer_json.get("query_description") or answer_json.get("description")
+    if desc:
+        sections.append(f"## Query Description\n\n{desc}\n")
 
-    if "statement_response" in answer_json:
-        statement_response = answer_json["statement_response"]
-        logger.info(f"Found statement_response: {statement_response}")
-        
-        if "result" in statement_response and "data_array" in statement_response["result"]:
-            response += "## Query Results\n\n"
-            
-            schema = statement_response.get("manifest", {}).get("schema", {})
-            columns = schema.get("columns", [])
-            logger.info(f"Schema columns: {columns}")
-            
-            header = "| " + " | ".join(col["name"] for col in columns) + " |"
-            separator = "|" + "|".join(["---" for _ in columns]) + "|"
-            response += header + "\n" + separator + "\n"
-            
-            data_array = statement_response["result"]["data_array"]
-            logger.info(f"Data array: {data_array}")
-            
-            for row in data_array:
-                formatted_row = []
-                for value, col in zip(row, columns):
-                    if value is None:
-                        formatted_value = "NULL"
-                    elif col["type_name"] in ["DECIMAL", "DOUBLE", "FLOAT"]:
-                        formatted_value = f"{float(value):,.2f}"
-                    elif col["type_name"] in ["INT", "BIGINT", "LONG"]:
-                        formatted_value = f"{int(value):,}"
-                    else:
-                        formatted_value = str(value)
-                    formatted_row.append(formatted_value)
-                response += "| " + " | ".join(formatted_row) + " |\n"
-        else:
-            logger.error(f"Missing result or data_array in statement_response: {statement_response}")
-    elif "message" in answer_json:
-        response += f"{answer_json['message']}\n\n"
+    # ─────────────────────────────────────────────
+    # 2) Metadata (row count, execution time)
+    # ─────────────────────────────────────────────
+    metadata = answer_json.get("query_result_metadata", {})
+    if isinstance(metadata, dict):
+        meta_lines = []
+        if "row_count" in metadata:
+            meta_lines.append(f"**Row Count:** {metadata['row_count']}")
+        if "execution_time_ms" in metadata:
+            meta_lines.append(f"**Execution Time:** {metadata['execution_time_ms']}ms")
+        if meta_lines:
+            sections.append("\n".join(meta_lines) + "\n")
+
+    # ─────────────────────────────────────────────
+    # 3) Query Results Table
+    # ─────────────────────────────────────────────
+    stmt = answer_json.get("statement_response", {})
+    result = stmt.get("result", {})
+    rows   = result.get("data_array", [])
+    schema = result.get("schema", {}).get("columns", [])
+
+    if rows and schema:
+        # header
+        header = "| " + " | ".join(col["name"] for col in schema) + " |"
+        sep    = "|" + "|".join(" --- " for _ in schema) + "|"
+        table_lines = [header, sep]
+
+        # data rows
+        for row in rows:
+            formatted = []
+            for val, col in zip(row, schema):
+                if val is None:
+                    formatted.append("NULL")
+                elif col.get("type_name") in ("DECIMAL", "DOUBLE", "FLOAT"):
+                    formatted.append(f"{float(val):,.2f}")
+                elif col.get("type_name") in ("INT", "BIGINT", "LONG"):
+                    formatted.append(f"{int(val):,}")
+                else:
+                    formatted.append(str(val))
+            table_lines.append("| " + " | ".join(formatted) + " |")
+
+        sections.append("## Query Results\n\n" + "\n".join(table_lines) + "\n")
     else:
-        response += "No data available.\n\n"
-        logger.error("No statement_response or message found in answer_json")
-    
-    return response
+        logger.debug("No results table to render")
+
+    # ─────────────────────────────────────────────
+    # 4) Collapsible raw SQL (if we captured it)
+    # ─────────────────────────────────────────────
+    raw_sql = answer_json.get("sql") or answer_json.get("query")
+    if raw_sql:
+        details_block = (
+            "<details>\n"
+            "  <summary><b>View generated SQL</b></summary>\n\n"
+            "```sql\n"
+            f"{raw_sql.strip()}\n"
+            "```\n"
+            "</details>\n"
+        )
+        sections.append(details_block)
+
+    # ─────────────────────────────────────────────
+    # Fallback: if absolutely nothing added
+    # ─────────────────────────────────────────────
+    if not sections:
+        logger.error("No data available to show in process_query_results")
+        return "No data available.\n\n"
+
+    return "\n".join(sections)
+
 
 SETTINGS = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD
                                        )
