@@ -178,7 +178,9 @@ async def ask_genie(
     try:
         loop = asyncio.get_running_loop()
 
-        # 1) Start or continue the conversation
+        # ───────────────────────────────────────────────────────────────────────────
+        # 1) start or continue conversation
+        # ───────────────────────────────────────────────────────────────────────────
         if conversation_id is None:
             initial_message = await loop.run_in_executor(
                 None, genie_api.start_conversation_and_wait, space_id, question
@@ -186,66 +188,62 @@ async def ask_genie(
             conversation_id = initial_message.conversation_id
         else:
             initial_message = await loop.run_in_executor(
-                None, genie_api.create_message_and_wait,
+                None,
+                genie_api.create_message_and_wait,
                 space_id, conversation_id, question
             )
 
         message_id = initial_message.message_id
 
-        # 2) Poll for COMPLETED with retries
+        # ───────────────────────────────────────────────────────────────────────────
+        # 2) poll for COMPLETED with exponential backoff
+        # ───────────────────────────────────────────────────────────────────────────
         max_attempts = 5
-        backoff_base = 2  # seconds
-        message_content = None
-
+        backoff_base = 2
         for attempt in range(1, max_attempts + 1):
-            # fetch the message status & payload
             message_content = await loop.run_in_executor(
                 None,
                 genie_api.get_message,
                 space_id, conversation_id, message_id
             )
-
             status = getattr(message_content, "status", None)
             logger.debug(f"[Poll {attempt}/{max_attempts}] status={status}")
 
             if status == MessageStatus.COMPLETED:
-                logger.debug("Genie returned COMPLETED")
                 break
-
             if status == MessageStatus.FAILED:
-                error_msg = getattr(message_content, "error_message", "<no error>")
-                logger.error(f"Genie FAILED on attempt {attempt}: {error_msg}")
-
+                err = getattr(message_content, "error_message", "<no error>")
+                logger.error(f"Genie FAILED on attempt {attempt}: {err}")
             else:
-                logger.debug(f"Genie not ready, sleeping {backoff_base ** attempt}s")
+                logger.debug(f"Sleeping {backoff_base**attempt}s before retry")
 
             if attempt < max_attempts:
                 time.sleep(backoff_base ** attempt)
             else:
                 raise RuntimeError(f"Genie did not complete after {max_attempts} attempts")
 
-        # 3) Process the completed message_content exactly as before
         logger.info(f"Raw message content: {message_content}")
 
-        # FIRST: if there are attachments, prefer those
+        # ───────────────────────────────────────────────────────────────────────────
+        # 3) handle any plain‑text attachments first
+        # ───────────────────────────────────────────────────────────────────────────
         if message_content.attachments:
             for attachment in message_content.attachments:
-                # 3a) A plain‑text attachment (e.g. “I retrieved the data….”)
                 text_obj = getattr(attachment, "text", None)
                 if text_obj and hasattr(text_obj, "content"):
-                    # return exactly what Genie’s .text.content says
                     return json.dumps({"message": text_obj.content}), conversation_id
 
-                # 3b) A SQL card attachment
+                # ───────────────────────────────────────────────────────────────────────
+                # 3b) handle the SQL card attachment
+                # ───────────────────────────────────────────────────────────────────────
                 attachment_id = getattr(attachment, "attachment_id", None)
                 query_obj     = getattr(attachment, "query", None)
                 if attachment_id and query_obj:
+                    # pull description & raw SQL from the SDK object
+                    desc    = getattr(query_obj, "description", "")
+                    raw_sql = getattr(query_obj, "query", "")
 
-                    # 1) pull description & raw SQL from the SDK attachment object
-                    desc    = getattr(query_obj, "description", None)
-                    raw_sql = getattr(query_obj, "query", None)
-
-                    # 2) now fetch the query-result body
+                    # fetch the actual query‑result JSON
                     query_result = await loop.run_in_executor(
                         None,
                         get_attachment_query_result,
@@ -255,42 +253,42 @@ async def ask_genie(
                         attachment_id
                     )
 
-                    # 3) decorate your JSON however you like—in Teams you can even
-                    #    render the SQL in a collapsed `<details>` block:
-                    # (A) Build the collapsible SQL block if we have raw_sql
-                    markdown_sql = (
-                        "<details>\n"
-                        "  <summary><b>View generated SQL</b></summary>\n\n"
-                        "```sql\n"
-                        f"{raw_sql.strip()}\n"
-                        "```\n"
-                        "</details>"
-                    ) if raw_sql else None
+                    # collapse the SQL into <details> if we got raw_sql
+                    sql_block = ""
+                    if raw_sql:
+                        sql_block = (
+                            "<details>\n"
+                            "  <summary><b>View generated SQL</b></summary>\n\n"
+                            "```sql\n"
+                            f"{raw_sql.strip()}\n"
+                            "```\n"
+                            "</details>\n"
+                        )
 
-                    # (B) Construct ONE single dict with all the keys your renderer expects:
+                    # build the ONE payload your renderer expects
                     payload = {
-                        "query_description":     desc or "",
+                        "query_description":     desc,
                         "query_result_metadata": query_result.get("query_result_metadata", {}),
                         "statement_response": {
-                            "result":        query_result.get("data_array", []),
+                            "result":     query_result.get("data_array", []),
                             "manifest": {
-                                "schema":    query_result.get("schema", {}),
+                                "schema": query_result.get("schema", {})
                             }
                         },
-                        # only include the raw_sql_markdown key *if* markdown_sql is truthy
-                        **({"raw_sql_markdown": markdown_sql} if markdown_sql else {})
+                        **({"raw_sql_markdown": sql_block} if sql_block else {})
                     }
 
-                    # (C) And *return* that dict (serialized to JSON)
                     return json.dumps(payload), conversation_id
 
-        # THIRD: nothing meaningful found → error fallback
+        # ───────────────────────────────────────────────────────────────────────────
+        # 4) no attachments → fallback
+        # ───────────────────────────────────────────────────────────────────────────
         return json.dumps({"error": "No data available."}), conversation_id
 
-
     except Exception as e:
-        logger.error(f"Error in ask_genie: {str(e)}")
+        logger.error(f"Error in ask_genie: {e}")
         return json.dumps({"error": "An error occurred while processing your request."}), conversation_id
+
 
 
 def process_query_results(answer_json: Dict) -> str:
