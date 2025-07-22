@@ -224,21 +224,7 @@ async def ask_genie(
             else:
                 raise RuntimeError(f"Genie did not complete after {max_attempts} attempts")
 
-        # # 3) Process the completed message_content exactly as before
-        # logger.info(f"Raw message content: {message_content}")
-
-        # if message_content.attachments:
-        #     for attachment in message_content.attachments:
-        #         text_obj = getattr(attachment, "text", None)
-
-        #         if isinstance(text_obj, dict) and "content" in text_obj:
-        #             return json.dumps({"message": text_obj["content"]}), conversation_id
-
         # 3) Process the completed message_content exactly as before
-        logger.info(f"Raw message content: {message_content}")
-
-       
-                # 3) Process the completed message_content
         logger.info(f"Raw message content: {message_content}")
 
         # FIRST: if there are attachments, prefer those
@@ -254,6 +240,12 @@ async def ask_genie(
                 attachment_id = getattr(attachment, "attachment_id", None)
                 query_obj     = getattr(attachment, "query", None)
                 if attachment_id and query_obj:
+
+                    # 1) pull description & raw SQL from the SDK attachment object
+                    desc    = getattr(query_obj, "description", None)
+                    raw_sql = getattr(query_obj, "query", None)
+
+                    # 2) now fetch the query-result body
                     query_result = await loop.run_in_executor(
                         None,
                         get_attachment_query_result,
@@ -263,32 +255,30 @@ async def ask_genie(
                         attachment_id
                     )
 
-                    # 2) pull description & raw SQL from the SDK attachment object
-                    desc    = getattr(query_obj, "description", None)
-                    raw_sql = getattr(query_obj, "query", None)
-
                     # 3) decorate your JSON however you like—in Teams you can even
                     #    render the SQL in a collapsed `<details>` block:
-                    markdown_sql = (
-                        "<details>\n"
-                        "  <summary><b>View generated SQL</b></summary>\n\n"
-                        "```sql\n"
-                        f"{raw_sql}\n"
-                        "```\n"
-                        "</details>"
-                    ) if raw_sql else None
+                    markdown_sql = None
+                    if raw_sql:
+                        markdown_sql = (
+                            "<details>\n"
+                            "  <summary><b>View generated SQL</b></summary>\n\n"
+                            "```sql\n"
+                            f"{raw_sql}\n"
+                            "```\n"
+                            "</details>"
+                        )
 
-                    payload = {
-                        "description": desc,
-                        "results": query_result,    # whatever shape your helper returns
-                    }
-                    if markdown_sql:
-                        payload["sql"] = markdown_sql
-
-                    return json.dumps(payload), conversation_id
-
-
-                    return json.dumps(query_result), conversation_id
+                    # 4) shape the JSON exactly for process_query_results
+                    return json.dumps({
+                        "query_description":     desc,
+                        "query_result_metadata": query_result.get("query_result_metadata", {}),
+                        "statement_response": {
+                            "result": query_result.get("data_array", []),
+                            "manifest": {"schema": query_result.get("schema", {})}
+                        },
+                        # only include SQL block if we generated it
+                        **({"raw_sql_markdown": markdown_sql} if markdown_sql else {})
+                    }), conversation_id
 
         # THIRD: nothing meaningful found → error fallback
         return json.dumps({"error": "No data available."}), conversation_id
@@ -306,9 +296,8 @@ def process_query_results(answer_json: Dict) -> str:
     # ─────────────────────────────────────────────
     # 1) Query Description (if provided)
     # ─────────────────────────────────────────────
-    desc = answer_json.get("query_description") or answer_json.get("description")
-    if desc:
-        sections.append(f"## Query Description\n\n{desc}\n")
+    if "query_description" in answer_json and answer_json["query_description"]:
+        sections.append(f"## Query Description\n\n{answer_json['query_description']}\n")
 
     # ─────────────────────────────────────────────
     # 2) Metadata (row count, execution time)
@@ -326,13 +315,13 @@ def process_query_results(answer_json: Dict) -> str:
     # ─────────────────────────────────────────────
     # 3) Query Results Table
     # ─────────────────────────────────────────────
-    stmt = answer_json.get("statement_response", {})
+    stmt   = answer_json.get("statement_response", {})
     result = stmt.get("result", {})
     rows   = result.get("data_array", [])
     schema = result.get("schema", {}).get("columns", [])
 
     if rows and schema:
-        # header
+        # header row
         header = "| " + " | ".join(col["name"] for col in schema) + " |"
         sep    = "|" + "|".join(" --- " for _ in schema) + "|"
         table_lines = [header, sep]
@@ -358,17 +347,9 @@ def process_query_results(answer_json: Dict) -> str:
     # ─────────────────────────────────────────────
     # 4) Collapsible raw SQL (if we captured it)
     # ─────────────────────────────────────────────
-    raw_sql = answer_json.get("sql") or answer_json.get("query")
-    if raw_sql:
-        details_block = (
-            "<details>\n"
-            "  <summary><b>View generated SQL</b></summary>\n\n"
-            "```sql\n"
-            f"{raw_sql.strip()}\n"
-            "```\n"
-            "</details>\n"
-        )
-        sections.append(details_block)
+    raw_sql_md = answer_json.get("raw_sql_markdown")
+    if raw_sql_md:
+        sections.append(raw_sql_md)
 
     # ─────────────────────────────────────────────
     # Fallback: if absolutely nothing added
@@ -377,8 +358,8 @@ def process_query_results(answer_json: Dict) -> str:
         logger.error("No data available to show in process_query_results")
         return "No data available.\n\n"
 
+    # join all the pieces with blank lines between them
     return "\n".join(sections)
-
 
 SETTINGS = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD
                                        )
