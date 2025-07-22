@@ -270,11 +270,8 @@ async def ask_genie(
                         "query_description":     desc,
                         "query_result_metadata": query_result.get("query_result_metadata", {}),
                         "statement_response": {
-                            # ▶︎ result must be a dict with data_array & schema
-                            "result": {
-                                "data_array": query_result.get("data_array", []),
-                                "schema":     query_result.get("schema", {}),
-                            }
+                            # pass through the full dict that contains both data_array & schema
+                            "result": query_result
                         },
                         # only include if we actually have SQL to show
                         **({"raw_sql_markdown": sql_block} if sql_block else {})
