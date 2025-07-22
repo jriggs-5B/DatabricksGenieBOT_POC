@@ -257,28 +257,32 @@ async def ask_genie(
 
                     # 3) decorate your JSON however you like—in Teams you can even
                     #    render the SQL in a collapsed `<details>` block:
-                    markdown_sql = None
-                    if raw_sql:
-                        markdown_sql = (
-                            "<details>\n"
-                            "  <summary><b>View generated SQL</b></summary>\n\n"
-                            "```sql\n"
-                            f"{raw_sql}\n"
-                            "```\n"
-                            "</details>"
-                        )
+                    # (A) Build the collapsible SQL block if we have raw_sql
+                    markdown_sql = (
+                        "<details>\n"
+                        "  <summary><b>View generated SQL</b></summary>\n\n"
+                        "```sql\n"
+                        f"{raw_sql.strip()}\n"
+                        "```\n"
+                        "</details>"
+                    ) if raw_sql else None
 
-                    # 4) shape the JSON exactly for process_query_results
-                    return json.dumps({
-                        "query_description":     desc,
+                    # (B) Construct ONE single dict with all the keys your renderer expects:
+                    payload = {
+                        "query_description":     desc or "",
                         "query_result_metadata": query_result.get("query_result_metadata", {}),
                         "statement_response": {
-                            "result": query_result.get("data_array", []),
-                            "manifest": {"schema": query_result.get("schema", {})}
+                            "result":        query_result.get("data_array", []),
+                            "manifest": {
+                                "schema":    query_result.get("schema", {}),
+                            }
                         },
-                        # only include SQL block if we generated it
+                        # only include the raw_sql_markdown key *if* markdown_sql is truthy
                         **({"raw_sql_markdown": markdown_sql} if markdown_sql else {})
-                    }), conversation_id
+                    }
+
+                    # (C) And *return* that dict (serialized to JSON)
+                    return json.dumps(payload), conversation_id
 
         # THIRD: nothing meaningful found → error fallback
         return json.dumps({"error": "No data available."}), conversation_id
@@ -393,19 +397,10 @@ class MyBot(ActivityHandler):
             await turn_context.send_activity("Failed to decode response from the server.")
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")
-            await turn_context.send_activity("An error occurred while processing your request.")
-            logger.error(f"ask_genie failed or empty result: {e}")
             await turn_context.send_activity(
                  "❗️ I’m sorry—I wasn’t able to fetch an answer from Genie right now. "
                  "Please try again in a moment, or reach out if the problem persists."
              )
-
-            await turn_context.send_activity(response)
-        except json.JSONDecodeError:
-            await turn_context.send_activity("Failed to decode response from the server.")
-        except Exception as e:
-            logger.error(f"Error processing message: {str(e)}")
-            await turn_context.send_activity("An error occurred while processing your request.")
 
     async def on_members_added_activity(self, members_added: List[ChannelAccount], turn_context: TurnContext):
         for member in members_added:
