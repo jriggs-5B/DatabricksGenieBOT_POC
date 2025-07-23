@@ -20,7 +20,7 @@ import time
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from aiohttp import web
-from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, ActivityHandler, TurnContext
+from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, ActivityHandler, TurnContext, MessageFactory
 from botbuilder.schema import Activity, ChannelAccount, Attachment
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.dashboards import GenieAPI, MessageStatus
@@ -306,166 +306,230 @@ def build_sql_toggle_card(raw_sql: str) -> Attachment:
       content=card
     )
 
+def process_query_results(answer_json: Dict) -> str:
+    sections: List[str] = []
+    logger.info(f"Processing answer JSON: {answer_json}")
 
-def process_query_results_card(answer_json: Dict) -> Attachment:
-    # pull out the pieces
-    desc     = answer_json.get("query_description", "")
-    stmt     = answer_json.get("statement_response", {})
-    rows     = stmt.get("result", {}).get("data_array", [])
-    cols     = stmt.get("manifest", {}).get("schema", {}).get("columns", [])
-    raw_sql  = answer_json.get("raw_sql", "")
+    # 1) Query Description
+    desc = answer_json.get("query_description")
+    if desc:
+        sections.append(f"## Query Description\n\n{desc}\n")
 
-    # build header columns
-    header_columns = [
-        {
-            "type": "Column",
-            "width": "stretch",
-            "items": [
-                {"type": "TextBlock", "text": col["name"], "weight": "Bolder", "wrap": True}
-            ]
-        }
-        for col in cols
-    ]
+    # 2) Metadata (row_count, execution_time_ms)
+    meta = answer_json.get("query_result_metadata", {})
+    if isinstance(meta, dict):
+        meta_bits = []
+        if "row_count" in meta:
+            meta_bits.append(f"**Row Count:** {meta['row_count']}")
+        if "execution_time_ms" in meta:
+            meta_bits.append(f"**Execution Time:** {meta['execution_time_ms']}ms")
+        if meta_bits:
+            sections.append("\n".join(meta_bits) + "\n")
 
-    # build data rows with comma formatting & horizontal separators
-    data_containers = []
-    for row in rows:
-        formatted = []
-        for val, col in zip(row, cols):
-            if val is None:
-                txt = "NULL"
-            elif col.get("type_name") in ("INT","BIGINT","LONG","DECIMAL","DOUBLE","FLOAT"):
-                # numeric: format with commas
-                num = float(val) if "." in str(val) else int(val)
-                txt = f"{num:,}"
-            else:
-                txt = str(val)
-            formatted.append(txt)
+    # 3) Results table
+    stmt = answer_json.get("statement_response", {})
+    result = stmt.get("result", {})              # <-- this is the dict you saw
+    rows   = result.get("data_array", [])
+    # the schema columns live under manifest.schema.columns
+    manifest = stmt.get("manifest", {})
+    schema   = manifest.get("schema", {}).get("columns", [])
 
-        data_containers.append({
-            "type": "Container",
-            "separator": True,      # draws a line above this row
-            "items": [{
-                "type": "ColumnSet",
-                "columns": [
-                    {
-                        "type": "Column",
-                        "width": "stretch",
-                        "items": [
-                            {"type": "TextBlock", "text": cell, "wrap": True}
-                        ]
-                    }
-                    for cell in formatted
-                ]
-            }]
-        })
+    if rows and schema:
+        # build header
+        header = "| " + " | ".join(col["name"] for col in schema) + " |"
+        sep    = "|" + "|".join(" --- " for _ in schema) + "|"
+        table = [header, sep]
 
-    # # build a list of ColumnSet objects—one per row
-    # data_rows = []
-    # for row in rows:
-    #     data_rows.append({
-    #         "type": "ColumnSet",
-    #         "columns": [
-    #             {
-    #                 "type": "Column",
-    #                 "width": "stretch",
-    #                 "items": [
-    #                     {"type": "TextBlock", "text": str(val), "wrap": True}
-    #                 ]
-    #             }
-    #             for val in row
-    #         ]
-    #     })
+        # populate rows
+        for row in rows:
+            out = []
+            for val, col in zip(row, schema):
+                if val is None:
+                    out.append("NULL")
+                elif col.get("type_name") in ("DECIMAL", "DOUBLE", "FLOAT"):
+                    out.append(f"{float(val):,.2f}")
+                elif col.get("type_name") in ("INT", "BIGINT", "LONG"):
+                    out.append(f"{int(val):,}")
+                else:
+                    out.append(str(val))
+            table.append("| " + " | ".join(out) + " |")
 
-    # adaptive card JSON
-    card = {
-    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-    "type": "AdaptiveCard",
-    "version": "1.5",
-    "body": [
-    # Description
-    {"type": "TextBlock", "text": "Query Description", "weight": "Bolder"},
-    {"type": "TextBlock", "text": desc, "wrap": True},
+        sections.append("## Query Results\n\n" + "\n".join(table) + "\n")
+    else:
+        logger.debug("No results table to render")
 
-    # Results header
-    {"type": "TextBlock", "text": "Query Results", "weight": "Bolder", "spacing": "Medium"},
-    {
-        "type": "Container",
-        "items": [
-        {
-            "type": "ColumnSet",
-            "columns": header_columns
-        }
-        ],
-        "separator": True  # line above header
-    }
-    ] + data_containers + [
-    # SQL toggle
-    {
-        "type": "Container",
-        "id": "sqlContainer",
-        "isVisible": False,
-        "items": [
-        {"type": "TextBlock", "text": "Generated SQL", "weight": "Bolder"},
-        {"type": "TextBlock", "text": raw_sql, "wrap": True}
-        ],
-        "spacing": "Medium"
-    }
-    ],
-    "actions": [
-    {
-        "type": "Action.ToggleVisibility",
-        "title": "Show SQL",
-        "targetElements": ["sqlContainer"]
-    }
-    ]
-}
+    # 4) Collapsible SQL block
+    raw_sql_md = answer_json.get("raw_sql_markdown")
+    if raw_sql_md:
+        sections.append(raw_sql_md + "\n")
+
+    # 5) If nothing at all…
+    if not sections:
+        logger.error("No data available to show in process_query_results")
+        return "No data available.\n\n"
+
+    # stitch and return
+    return "\n".join(sections)
+
+# def process_query_results_card(answer_json: Dict) -> Attachment:
+#     # pull out the pieces
+#     desc     = answer_json.get("query_description", "")
+#     stmt     = answer_json.get("statement_response", {})
+#     rows     = stmt.get("result", {}).get("data_array", [])
+#     cols     = stmt.get("manifest", {}).get("schema", {}).get("columns", [])
+#     raw_sql  = answer_json.get("raw_sql", "")
+
+#     # build header columns
+#     header_columns = [
+#         {
+#             "type": "Column",
+#             "width": "stretch",
+#             "items": [
+#                 {"type": "TextBlock", "text": col["name"], "weight": "Bolder", "wrap": True}
+#             ]
+#         }
+#         for col in cols
+#     ]
+
+#     # build data rows with comma formatting & horizontal separators
+#     data_containers = []
+#     for row in rows:
+#         formatted = []
+#         for val, col in zip(row, cols):
+#             if val is None:
+#                 txt = "NULL"
+#             elif col.get("type_name") in ("INT","BIGINT","LONG","DECIMAL","DOUBLE","FLOAT"):
+#                 # numeric: format with commas
+#                 num = float(val) if "." in str(val) else int(val)
+#                 txt = f"{num:,}"
+#             else:
+#                 txt = str(val)
+#             formatted.append(txt)
+
+#         data_containers.append({
+#             "type": "Container",
+#             "separator": True,      # draws a line above this row
+#             "items": [{
+#                 "type": "ColumnSet",
+#                 "columns": [
+#                     {
+#                         "type": "Column",
+#                         "width": "stretch",
+#                         "items": [
+#                             {"type": "TextBlock", "text": cell, "wrap": True}
+#                         ]
+#                     }
+#                     for cell in formatted
+#                 ]
+#             }]
+#         })
+
+#     # # build a list of ColumnSet objects—one per row
+#     # data_rows = []
+#     # for row in rows:
+#     #     data_rows.append({
+#     #         "type": "ColumnSet",
+#     #         "columns": [
+#     #             {
+#     #                 "type": "Column",
+#     #                 "width": "stretch",
+#     #                 "items": [
+#     #                     {"type": "TextBlock", "text": str(val), "wrap": True}
+#     #                 ]
+#     #             }
+#     #             for val in row
+#     #         ]
+#     #     })
+
+#     # adaptive card JSON
+#     card = {
+#     "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+#     "type": "AdaptiveCard",
+#     "version": "1.5",
+#     "body": [
+#     # Description
+#     {"type": "TextBlock", "text": "Query Description", "weight": "Bolder"},
+#     {"type": "TextBlock", "text": desc, "wrap": True},
+
+#     # Results header
+#     {"type": "TextBlock", "text": "Query Results", "weight": "Bolder", "spacing": "Medium"},
+#     {
+#         "type": "Container",
+#         "items": [
+#         {
+#             "type": "ColumnSet",
+#             "columns": header_columns
+#         }
+#         ],
+#         "separator": True  # line above header
+#     }
+#     ] + data_containers + [
+#     # SQL toggle
+#     {
+#         "type": "Container",
+#         "id": "sqlContainer",
+#         "isVisible": False,
+#         "items": [
+#         {"type": "TextBlock", "text": "Generated SQL", "weight": "Bolder"},
+#         {"type": "TextBlock", "text": raw_sql, "wrap": True}
+#         ],
+#         "spacing": "Medium"
+#     }
+#     ],
+#     "actions": [
+#     {
+#         "type": "Action.ToggleVisibility",
+#         "title": "Show SQL",
+#         "targetElements": ["sqlContainer"]
+#     }
+#     ]
+# }
 
 
 
-    # card = {
-    #   "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-    #   "type": "AdaptiveCard",
-    #   "version": "1.5",
-    #   "body": [
-    #     # Query Description
-    #     {"type": "TextBlock", "text": "Query Description", "weight": "Bolder"},
-    #     {"type": "TextBlock", "text": desc, "wrap": True},
-    #   ]
-    #   # only add table if we have columns + rows
-    #   + (
-    #     [
-    #       # column headers
-    #       {"type": "TextBlock", "text": "Results", "weight": "Bolder", "spacing": "Medium"},
-    #       {"type": "ColumnSet", "columns": header_columns},
-    #     ]
-    #     + data_containers
-    #   )
-    #   # SQL container (always present, even if no rows)
-    #   + [
-    #     {
-    #       "type": "Container",
-    #       "id": "sqlContainer",
-    #       "isVisible": False,
-    #       "items": [
-    #         {"type": "TextBlock", "text": "Generated SQL", "weight": "Bolder"},
-    #         {"type": "TextBlock", "text": raw_sql, "wrap": True}
-    #       ]
-    #     }
-    #   ],
-    #   "actions": [
-    #     {
-    #       "type": "Action.ToggleVisibility",
-    #       "title": "Show SQL",
-    #       "targetElements": ["sqlContainer"]
-    #     }
-    #   ]
-    # }
+#     # card = {
+#     #   "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+#     #   "type": "AdaptiveCard",
+#     #   "version": "1.5",
+#     #   "body": [
+#     #     # Query Description
+#     #     {"type": "TextBlock", "text": "Query Description", "weight": "Bolder"},
+#     #     {"type": "TextBlock", "text": desc, "wrap": True},
+#     #   ]
+#     #   # only add table if we have columns + rows
+#     #   + (
+#     #     [
+#     #       # column headers
+#     #       {"type": "TextBlock", "text": "Results", "weight": "Bolder", "spacing": "Medium"},
+#     #       {"type": "ColumnSet", "columns": header_columns},
+#     #     ]
+#     #     + data_containers
+#     #   )
+#     #   # SQL container (always present, even if no rows)
+#     #   + [
+#     #     {
+#     #       "type": "Container",
+#     #       "id": "sqlContainer",
+#     #       "isVisible": False,
+#     #       "items": [
+#     #         {"type": "TextBlock", "text": "Generated SQL", "weight": "Bolder"},
+#     #         {"type": "TextBlock", "text": raw_sql, "wrap": True}
+#     #       ]
+#     #     }
+#     #   ],
+#     #   "actions": [
+#     #     {
+#     #       "type": "Action.ToggleVisibility",
+#     #       "title": "Show SQL",
+#     #       "targetElements": ["sqlContainer"]
+#     #     }
+#     #   ]
+#     # }
 
-    return Attachment(
-        content_type="application/vnd.microsoft.card.adaptive",
-        content=card
-    )
+#     return Attachment(
+#         content_type="application/vnd.microsoft.card.adaptive",
+#         content=card
+#     )
 
 
 SETTINGS = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
@@ -488,17 +552,18 @@ class MyBot(ActivityHandler):
             )
             self.conversation_ids[user_id] = new_conversation_id
 
-            # 2) parse & render
+            # 2) parse JSON
             answer_json = json.loads(answer)
-            card_attachment    = process_query_results_card(answer_json)
 
-            # 3) send the Adaptive Card
-            logger.info("Sending Adaptive Card with query results")
+            # 3a) send plain‑text markdown (description + results)
+            plain_markdown = process_query_results(answer_json)
+            await turn_context.send_activity(plain_markdown)
+
+            # 3b) send only the SQL toggle card
+            raw_sql = answer_json.get("raw_sql", "")
+            sql_card = build_sql_toggle_card(raw_sql)
             await turn_context.send_activity(
-                Activity(
-                    type="message",
-                    attachments=[card_attachment]
-                )
+                MessageFactory.attachment(sql_card)
             )
 
         except json.JSONDecodeError as jde:
