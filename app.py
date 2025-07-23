@@ -268,22 +268,31 @@ async def ask_genie(
                             "</details>"
                         )
 
-                    # — NOW assemble the **one** payload dict that matches
-                    #   your process_query_results signature exactly:
-                    normalized = {
+                    # ─────────────────────────────────────────────────────
+                    # 3) Shape the JSON so process_query_results finds exactly:
+                    #    statement_response.result.data_array
+                    #    statement_response.result.schema.columns
+                    # ─────────────────────────────────────────────────────
+                    schema_cols = getattr(attachment, "statement_response", {}) \
+                                    .get("manifest", {}) \
+                                    .get("schema", {}) \
+                                    .get("columns", [])
+
+                    payload = {
                         "query_description":     desc or "",
-                        "query_result_metadata": query_result.get("query_result_metadata", {}),
+                        "query_result_metadata": {},        # your helper isn’t returning any top‑level metadata
                         "statement_response": {
                             "result": {
-                                "data_array": query_result.get("result", {}).get("data_array", []),
-                                "schema":     query_result.get("manifest", {}).get("schema", {}),
+                                "data_array": query_result.get("data_array", []),
+                                # shove the columns list into .schema.columns
+                                "schema":     { "columns": schema_cols },
                             }
                         },
                         **({"raw_sql_markdown": markdown_sql} if markdown_sql else {})
                     }
 
-                    logger.debug("🚀 FINAL GENIE PAYLOAD: %r", normalized)
-                    return json.dumps(normalized), conversation_id
+                    logger.debug("🚀 FINAL GENIE PAYLOAD: %r", payload)
+                    return json.dumps(payload), conversation_id
 
         # ────────────────
         # Fallback if no attachments at all
