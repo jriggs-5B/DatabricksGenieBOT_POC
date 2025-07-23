@@ -234,54 +234,101 @@ async def ask_genie(
                 if text_obj and hasattr(text_obj, "content"):
                     return json.dumps({"message": text_obj.content}), conversation_id
 
-                # ───────────────────────────────────────────────────────────────────────
-                # 3b) handle the SQL card attachment
-                # ───────────────────────────────────────────────────────────────────────
+                # # ───────────────────────────────────────────────────────────────────────
+                # # 3b) handle the SQL card attachment
+                # # ───────────────────────────────────────────────────────────────────────
+                # attachment_id = getattr(attachment, "attachment_id", None)
+                # query_obj     = getattr(attachment, "query", None)
+                # if attachment_id and query_obj:
+                #     # pull description & raw SQL from the SDK object
+                #     desc    = getattr(query_obj, "description", "")
+                #     raw_sql = getattr(query_obj, "query", "")
+
+                #     # fetch the actual query‑result JSON
+                #     query_result = await loop.run_in_executor(
+                #         None,
+                #         get_attachment_query_result,
+                #         space_id,
+                #         conversation_id,
+                #         message_id,
+                #         attachment_id
+                #     )
+
+                #     logger.debug(f"Fetched query_result: {query_result!r}")
+
+                #     # collapse the SQL into <details> if we got raw_sql
+                #     sql_block = ""
+                #     if raw_sql:
+                #         sql_block = (
+                #             "<details>\n"
+                #             "  <summary><b>View generated SQL</b></summary>\n\n"
+                #             "```sql\n"
+                #             f"{raw_sql.strip()}\n"
+                #             "```\n"
+                #             "</details>\n"
+                #         )
+
+                #     # build the ONE payload your renderer expects
+                #     payload = {
+                #         "query_description":     desc,
+                #         "query_result_metadata": query_result.get("query_result_metadata", {}),
+                #         "statement_response": {
+                #             # pass through the full dict that contains both data_array & schema
+                #             "result": query_result
+                #         },
+                #         # only include if we actually have SQL to show
+                #         **({"raw_sql_markdown": sql_block} if sql_block else {})
+                #     }
+
+                #     logger.debug("🚀  FINAL GENIE PAYLOAD: %s", payload)
+                #     return json.dumps(payload), conversation_id
+
+                # 3b) A SQL card attachment
                 attachment_id = getattr(attachment, "attachment_id", None)
                 query_obj     = getattr(attachment, "query", None)
                 if attachment_id and query_obj:
-                    # pull description & raw SQL from the SDK object
+
+                    # pull description & raw SQL
                     desc    = getattr(query_obj, "description", "")
                     raw_sql = getattr(query_obj, "query", "")
 
-                    # fetch the actual query‑result JSON
+                    # fetch the actual query result
                     query_result = await loop.run_in_executor(
                         None,
                         get_attachment_query_result,
-                        space_id,
-                        conversation_id,
-                        message_id,
-                        attachment_id
+                        space_id, conversation_id, message_id, attachment_id
                     )
 
-                    logger.debug(f"Fetched query_result: {query_result!r}")
+                    # build collapsible SQL markdown if we have raw_sql
+                    markdown_sql = (
+                        "<details>\n"
+                        "  <summary><b>View generated SQL</b></summary>\n\n"
+                        "```sql\n"
+                        f"{raw_sql.strip()}\n"
+                        "```\n"
+                        "</details>"
+                    ) if raw_sql else None
 
-                    # collapse the SQL into <details> if we got raw_sql
-                    sql_block = ""
-                    if raw_sql:
-                        sql_block = (
-                            "<details>\n"
-                            "  <summary><b>View generated SQL</b></summary>\n\n"
-                            "```sql\n"
-                            f"{raw_sql.strip()}\n"
-                            "```\n"
-                            "</details>\n"
-                        )
-
-                    # build the ONE payload your renderer expects
-                    payload = {
+                    # **HERE** we shape _exactly_ the JSON your renderer expects:
+                    final_payload = {
                         "query_description":     desc,
                         "query_result_metadata": query_result.get("query_result_metadata", {}),
                         "statement_response": {
-                            # pass through the full dict that contains both data_array & schema
-                            "result": query_result
+                            "result": {
+                                "data_array": query_result.get("data_array", []),
+                                "schema": {
+                                    "columns": query_result.get("schema", {})\
+                                                            .get("columns", [])
+                                }
+                            }
                         },
-                        # only include if we actually have SQL to show
-                        **({"raw_sql_markdown": sql_block} if sql_block else {})
+                        # only include the SQL block if we generated one
+                        **({"raw_sql_markdown": markdown_sql} if markdown_sql else {})
                     }
 
-                    logger.debug("🚀  FINAL GENIE PAYLOAD: %s", payload)
-                    return json.dumps(payload), conversation_id
+                    logger.debug("🚀  FINAL GENIE PAYLOAD: %s", final_payload)
+                    return json.dumps(final_payload), conversation_id
+
 
         # ───────────────────────────────────────────────────────────────────────────
         # 4) no attachments → fallback
