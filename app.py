@@ -269,12 +269,12 @@ async def ask_genie(
                     # — NOW assemble the **one** payload dict that matches
                     #   your process_query_results signature exactly:
                     normalized = {
-                        "query_description":      desc or "",
-                        "query_result_metadata":  query_result.get("query_result_metadata", {}),
+                        "query_description":     desc or "",
+                        "query_result_metadata": query_result.get("query_result_metadata", {}),
                         "statement_response": {
                             "result": {
-                                "data_array": query_result.get("data_array", []),
-                                "schema":     query_result.get("schema", {})
+                                "data_array": query_result.get("result", {}).get("data_array", []),
+                                "schema":     query_result.get("manifest", {}).get("schema", {}),
                             }
                         },
                         **({"raw_sql_markdown": markdown_sql} if markdown_sql else {})
