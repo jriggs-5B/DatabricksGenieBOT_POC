@@ -272,13 +272,11 @@ async def ask_genie(
                         "query_description":     desc,
                         "query_result_metadata": query_result.get("query_result_metadata", {}),
                         "statement_response": {
-                            "result": {
-                                # pull rows & schema columns out of query_result
-                                "data_array": query_result.get("data_array", []),
-                                "schema": {"columns": query_result.get("schema", {}).get("columns", [])},
-                            }
+                            "result":  query_result.get("statement_response", {}).get("result", {}),
+                            "manifest": {"schema": query_result.get("statement_response", {}).get("manifest", {})},
                         },
                         **({"raw_sql_markdown": markdown_sql} if markdown_sql else {})
+
                     }
 
                     logger.debug("🚀 FINAL GENIE PAYLOAD: %r", normalized)
@@ -293,79 +291,143 @@ async def ask_genie(
         logger.error(f"Error in ask_genie: {e}", exc_info=True)
         return json.dumps({"error": "An error occurred while processing your request."}), conversation_id
 
-
-
 def process_query_results(answer_json: Dict) -> str:
     sections: List[str] = []
     logger.info(f"Processing answer JSON: {answer_json}")
 
-    # ─────────────────────────────────────────────
-    # 1) Query Description (if provided)
-    # ─────────────────────────────────────────────
-    if "query_description" in answer_json and answer_json["query_description"]:
-        sections.append(f"## Query Description\n\n{answer_json['query_description']}\n")
+    # 1) Query Description
+    desc = answer_json.get("query_description")
+    if desc:
+        sections.append(f"## Query Description\n\n{desc}\n")
 
-    # ─────────────────────────────────────────────
-    # 2) Metadata (row count, execution time)
-    # ─────────────────────────────────────────────
-    metadata = answer_json.get("query_result_metadata", {})
-    if isinstance(metadata, dict):
-        meta_lines = []
-        if "row_count" in metadata:
-            meta_lines.append(f"**Row Count:** {metadata['row_count']}")
-        if "execution_time_ms" in metadata:
-            meta_lines.append(f"**Execution Time:** {metadata['execution_time_ms']}ms")
-        if meta_lines:
-            sections.append("\n".join(meta_lines) + "\n")
+    # 2) Metadata (row_count, execution_time_ms)
+    meta = answer_json.get("query_result_metadata", {})
+    if isinstance(meta, dict):
+        meta_bits = []
+        if "row_count" in meta:
+            meta_bits.append(f"**Row Count:** {meta['row_count']}")
+        if "execution_time_ms" in meta:
+            meta_bits.append(f"**Execution Time:** {meta['execution_time_ms']}ms")
+        if meta_bits:
+            sections.append("\n".join(meta_bits) + "\n")
 
-    # ─────────────────────────────────────────────
-    # 3) Query Results Table
-    # ─────────────────────────────────────────────
-    stmt   = answer_json.get("statement_response", {})
-    result = stmt.get("result", {})
+    # 3) Results table
+    stmt = answer_json.get("statement_response", {})
+    result = stmt.get("result", {})              # <-- this is the dict you saw
     rows   = result.get("data_array", [])
-    schema = result.get("schema", {}).get("columns", [])
+    # the schema columns live under manifest.schema.columns
+    manifest = stmt.get("manifest", {})
+    schema   = manifest.get("schema", {}).get("columns", [])
 
     if rows and schema:
-        # header row
+        # build header
         header = "| " + " | ".join(col["name"] for col in schema) + " |"
         sep    = "|" + "|".join(" --- " for _ in schema) + "|"
-        table_lines = [header, sep]
+        table = [header, sep]
 
-        # data rows
+        # populate rows
         for row in rows:
-            formatted = []
+            out = []
             for val, col in zip(row, schema):
                 if val is None:
-                    formatted.append("NULL")
+                    out.append("NULL")
                 elif col.get("type_name") in ("DECIMAL", "DOUBLE", "FLOAT"):
-                    formatted.append(f"{float(val):,.2f}")
+                    out.append(f"{float(val):,.2f}")
                 elif col.get("type_name") in ("INT", "BIGINT", "LONG"):
-                    formatted.append(f"{int(val):,}")
+                    out.append(f"{int(val):,}")
                 else:
-                    formatted.append(str(val))
-            table_lines.append("| " + " | ".join(formatted) + " |")
+                    out.append(str(val))
+            table.append("| " + " | ".join(out) + " |")
 
-        sections.append("## Query Results\n\n" + "\n".join(table_lines) + "\n")
+        sections.append("## Query Results\n\n" + "\n".join(table) + "\n")
     else:
         logger.debug("No results table to render")
 
-    # ─────────────────────────────────────────────
-    # 4) Collapsible raw SQL (if we captured it)
-    # ─────────────────────────────────────────────
+    # 4) Collapsible SQL block
     raw_sql_md = answer_json.get("raw_sql_markdown")
     if raw_sql_md:
-        sections.append(raw_sql_md)
+        sections.append(raw_sql_md + "\n")
 
-    # ─────────────────────────────────────────────
-    # Fallback: if absolutely nothing added
-    # ─────────────────────────────────────────────
+    # 5) If nothing at all…
     if not sections:
         logger.error("No data available to show in process_query_results")
         return "No data available.\n\n"
 
-    # join all the pieces with blank lines between them
+    # stitch and return
     return "\n".join(sections)
+
+
+# def process_query_results(answer_json: Dict) -> str:
+#     sections: List[str] = []
+#     logger.info(f"Processing answer JSON: {answer_json}")
+
+#     # ─────────────────────────────────────────────
+#     # 1) Query Description (if provided)
+#     # ─────────────────────────────────────────────
+#     if "query_description" in answer_json and answer_json["query_description"]:
+#         sections.append(f"## Query Description\n\n{answer_json['query_description']}\n")
+
+#     # ─────────────────────────────────────────────
+#     # 2) Metadata (row count, execution time)
+#     # ─────────────────────────────────────────────
+#     metadata = answer_json.get("query_result_metadata", {})
+#     if isinstance(metadata, dict):
+#         meta_lines = []
+#         if "row_count" in metadata:
+#             meta_lines.append(f"**Row Count:** {metadata['row_count']}")
+#         if "execution_time_ms" in metadata:
+#             meta_lines.append(f"**Execution Time:** {metadata['execution_time_ms']}ms")
+#         if meta_lines:
+#             sections.append("\n".join(meta_lines) + "\n")
+
+#     # ─────────────────────────────────────────────
+#     # 3) Query Results Table
+#     # ─────────────────────────────────────────────
+#     stmt   = answer_json.get("statement_response", {})
+#     result = stmt.get("result", {})
+#     rows   = result.get("data_array", [])
+#     schema = result.get("schema", {}).get("columns", [])
+
+#     if rows and schema:
+#         # header row
+#         header = "| " + " | ".join(col["name"] for col in schema) + " |"
+#         sep    = "|" + "|".join(" --- " for _ in schema) + "|"
+#         table_lines = [header, sep]
+
+#         # data rows
+#         for row in rows:
+#             formatted = []
+#             for val, col in zip(row, schema):
+#                 if val is None:
+#                     formatted.append("NULL")
+#                 elif col.get("type_name") in ("DECIMAL", "DOUBLE", "FLOAT"):
+#                     formatted.append(f"{float(val):,.2f}")
+#                 elif col.get("type_name") in ("INT", "BIGINT", "LONG"):
+#                     formatted.append(f"{int(val):,}")
+#                 else:
+#                     formatted.append(str(val))
+#             table_lines.append("| " + " | ".join(formatted) + " |")
+
+#         sections.append("## Query Results\n\n" + "\n".join(table_lines) + "\n")
+#     else:
+#         logger.debug("No results table to render")
+
+#     # ─────────────────────────────────────────────
+#     # 4) Collapsible raw SQL (if we captured it)
+#     # ─────────────────────────────────────────────
+#     raw_sql_md = answer_json.get("raw_sql_markdown")
+#     if raw_sql_md:
+#         sections.append(raw_sql_md)
+
+#     # ─────────────────────────────────────────────
+#     # Fallback: if absolutely nothing added
+#     # ─────────────────────────────────────────────
+#     if not sections:
+#         logger.error("No data available to show in process_query_results")
+#         return "No data available.\n\n"
+
+#     # join all the pieces with blank lines between them
+#     return "\n".join(sections)
 
 SETTINGS = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD
                                        )
