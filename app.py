@@ -254,6 +254,8 @@ async def ask_genie(
                         attachment_id,
                     )
 
+                    logger.debug(f"🔍 query_result from helper: {query_result!r}")
+
                     # — build a collapsible SQL block if we have SQL text —
                     markdown_sql = None
                     if raw_sql:
