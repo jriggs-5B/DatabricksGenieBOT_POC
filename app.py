@@ -276,6 +276,37 @@ async def ask_genie(
         logger.error(f"Error in ask_genie: {e}", exc_info=True)
         return json.dumps({"error": "An error occurred while processing your request."}), conversation_id
 
+
+def build_sql_toggle_card(raw_sql: str) -> Attachment:
+    card = {
+      "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+      "type": "AdaptiveCard",
+      "version": "1.5",
+      "body": [
+        {
+          "type": "Container",
+          "id": "sqlContainer",
+          "isVisible": False,
+          "items": [
+            { "type": "TextBlock", "text": "**Generated SQL**", "weight": "Bolder" },
+            { "type": "TextBlock", "text": raw_sql, "wrap": True }
+          ]
+        }
+      ],
+      "actions": [
+        {
+          "type": "Action.ToggleVisibility",
+          "title": "Show SQL",
+          "targetElements": ["sqlContainer"]
+        }
+      ]
+    }
+    return Attachment(
+      content_type="application/vnd.microsoft.card.adaptive",
+      content=card
+    )
+
+
 def process_query_results_card(answer_json: Dict) -> Attachment:
     # pull out the pieces
     desc     = answer_json.get("query_description", "")
