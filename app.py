@@ -175,6 +175,7 @@ async def ask_genie(
     conversation_id: Optional[str] = None
 ) -> tuple[str, str]:
     logger.debug("🔥 ENTERING ask_genie v2! 🔥")
+    logger.debug("🛠️  ASK_GENIE PAYLOAD HOTFIX DEPLOYED 🛠️")
     try:
         loop = asyncio.get_running_loop()
 
@@ -279,6 +280,7 @@ async def ask_genie(
                         **({"raw_sql_markdown": sql_block} if sql_block else {})
                     }
 
+                    logger.debug("🚀  FINAL GENIE PAYLOAD: %s", payload)
                     return json.dumps(payload), conversation_id
 
         # ───────────────────────────────────────────────────────────────────────────
