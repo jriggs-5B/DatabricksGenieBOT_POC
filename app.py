@@ -296,62 +296,140 @@ def process_query_results_card(answer_json: Dict) -> Attachment:
         for col in cols
     ]
 
-    # build a list of ColumnSet objects—one per row
-    data_rows = []
+    # build data rows with comma formatting & horizontal separators
+    data_containers = []
     for row in rows:
-        data_rows.append({
-            "type": "ColumnSet",
-            "columns": [
-                {
-                    "type": "Column",
-                    "width": "stretch",
-                    "items": [
-                        {"type": "TextBlock", "text": str(val), "wrap": True}
-                    ]
-                }
-                for val in row
-            ]
+        formatted = []
+        for val, col in zip(row, cols):
+            if val is None:
+                txt = "NULL"
+            elif col.get("type_name") in ("INT","BIGINT","LONG","DECIMAL","DOUBLE","FLOAT"):
+                # numeric: format with commas
+                num = float(val) if "." in str(val) else int(val)
+                txt = f"{num:,}"
+            else:
+                txt = str(val)
+            formatted.append(txt)
+
+        data_containers.append({
+            "type": "Container",
+            "separator": True,      # draws a line above this row
+            "items": [{
+                "type": "ColumnSet",
+                "columns": [
+                    {
+                        "type": "Column",
+                        "width": "stretch",
+                        "items": [
+                            {"type": "TextBlock", "text": cell, "wrap": True}
+                        ]
+                    }
+                    for cell in formatted
+                ]
+            }]
         })
+
+    # # build a list of ColumnSet objects—one per row
+    # data_rows = []
+    # for row in rows:
+    #     data_rows.append({
+    #         "type": "ColumnSet",
+    #         "columns": [
+    #             {
+    #                 "type": "Column",
+    #                 "width": "stretch",
+    #                 "items": [
+    #                     {"type": "TextBlock", "text": str(val), "wrap": True}
+    #                 ]
+    #             }
+    #             for val in row
+    #         ]
+    #     })
 
     # adaptive card JSON
     card = {
-      "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-      "type": "AdaptiveCard",
-      "version": "1.5",
-      "body": [
-        # Query Description
-        {"type": "TextBlock", "text": "Query Description", "weight": "Bolder"},
-        {"type": "TextBlock", "text": desc, "wrap": True},
-      ]
-      # only add table if we have columns + rows
-      + (
-        [
-          # column headers
-          {"type": "TextBlock", "text": "Results", "weight": "Bolder", "spacing": "Medium"},
-          {"type": "ColumnSet", "columns": header_columns},
-        ]
-        + data_rows
-      )
-      # SQL container (always present, even if no rows)
-      + [
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "type": "AdaptiveCard",
+    "version": "1.5",
+    "body": [
+    # Description
+    {"type": "TextBlock", "text": "Query Description", "weight": "Bolder"},
+    {"type": "TextBlock", "text": desc, "wrap": True},
+
+    # Results header
+    {"type": "TextBlock", "text": "Query Results", "weight": "Bolder", "spacing": "Medium"},
+    {
+        "type": "Container",
+        "items": [
         {
-          "type": "Container",
-          "id": "sqlContainer",
-          "isVisible": False,
-          "items": [
-            {"type": "TextBlock", "text": "Generated SQL", "weight": "Bolder"},
-            {"type": "TextBlock", "text": raw_sql, "wrap": True}
-          ]
+            "type": "ColumnSet",
+            "columns": header_columns
         }
-      ],
-      "actions": [
-        {
-          "type": "Action.ToggleVisibility",
-          "title": "Show SQL",
-          "targetElements": ["sqlContainer"]
-        }
-      ]
+        ],
+        "separator": True  # line above header
     }
+    ] + data_containers + [
+    # SQL toggle
+    {
+        "type": "Container",
+        "id": "sqlContainer",
+        "isVisible": False,
+        "items": [
+        {"type": "TextBlock", "text": "Generated SQL", "weight": "Bolder"},
+        {"type": "TextBlock", "text": raw_sql, "wrap": True}
+        ],
+        "spacing": "Medium"
+    }
+    ],
+    "actions": [
+    {
+        "type": "Action.ToggleVisibility",
+        "title": "Show SQL",
+        "targetElements": ["sqlContainer"]
+    }
+    ]
+}
+
+
+
+    # card = {
+    #   "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    #   "type": "AdaptiveCard",
+    #   "version": "1.5",
+    #   "body": [
+    #     # Query Description
+    #     {"type": "TextBlock", "text": "Query Description", "weight": "Bolder"},
+    #     {"type": "TextBlock", "text": desc, "wrap": True},
+    #   ]
+    #   # only add table if we have columns + rows
+    #   + (
+    #     [
+    #       # column headers
+    #       {"type": "TextBlock", "text": "Results", "weight": "Bolder", "spacing": "Medium"},
+    #       {"type": "ColumnSet", "columns": header_columns},
+    #     ]
+    #     + data_containers
+    #   )
+    #   # SQL container (always present, even if no rows)
+    #   + [
+    #     {
+    #       "type": "Container",
+    #       "id": "sqlContainer",
+    #       "isVisible": False,
+    #       "items": [
+    #         {"type": "TextBlock", "text": "Generated SQL", "weight": "Bolder"},
+    #         {"type": "TextBlock", "text": raw_sql, "wrap": True}
+    #       ]
+    #     }
+    #   ],
+    #   "actions": [
+    #     {
+    #       "type": "Action.ToggleVisibility",
+    #       "title": "Show SQL",
+    #       "targetElements": ["sqlContainer"]
+    #     }
+    #   ]
+    # }
 
     return Attachment(
         content_type="application/vnd.microsoft.card.adaptive",
