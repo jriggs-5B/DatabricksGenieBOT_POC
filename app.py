@@ -286,12 +286,13 @@ async def ask_genie(
                 # 3b) A SQL card attachment
                 attachment_id = getattr(attachment, "attachment_id", None)
                 query_obj     = getattr(attachment, "query", None)
+
                 if attachment_id and query_obj:
                     # 1) grab description & raw SQL
                     desc    = getattr(query_obj, "description", "")
                     raw_sql = getattr(query_obj, "query", "")
 
-                    # 2) fetch the SDK’s full query-result payload
+                    # 2) fetch the SDK’s full query‐result payload
                     query_result = await loop.run_in_executor(
                         None,
                         get_attachment_query_result,
@@ -301,23 +302,20 @@ async def ask_genie(
                         attachment_id
                     )
 
-                    # 3) robustly pull out rows & columns no matter the SDK version:
-                    #    some responses live under query_result["result"], others at top level
-                    if isinstance(query_result.get("result"), dict):
-                        rows = query_result["result"].get("data_array", [])
-                        schema_obj = query_result["result"].get("schema", {})
-                    else:
-                        rows = query_result.get("data_array", [])
-                        schema_obj = query_result.get("schema", {})
+                    # 3) pull out rows & columns in a version‐agnostic way:
+                    #    if they shipped nested under "result", drill in; otherwise top‐level
+                    inner = query_result.get("result") or {}
+                    rows = inner.get("data_array", query_result.get("data_array", []))
 
-                    #    likewise, columns may live under manifest.schema or directly under schema_obj
-                    if isinstance(query_result.get("manifest"), dict):
-                        cols = query_result["manifest"].get("schema", {})\
-                                            .get("columns", [])
-                    else:
-                        cols = schema_obj.get("columns", [])
+                    #    columns may live under manifest.schema or directly under a top‐level schema
+                    manifest = query_result.get("manifest", {})
+                    cols = (
+                        manifest.get("schema", {}).get("columns")
+                        or query_result.get("schema", {}).get("columns")
+                        or []
+                    )
 
-                    # 4) build your collapsible SQL block
+                    # 4) build the collapsible SQL block
                     markdown_sql = (
                         "<details>\n"
                         "  <summary><b>View generated SQL</b></summary>\n\n"
@@ -327,24 +325,20 @@ async def ask_genie(
                         "</details>"
                     ) if raw_sql else None
 
-                    # 5) now shape the one-and-only payload your renderer needs:
+                    # 5) assemble exactly the two lists your renderer expects:
                     final_payload = {
                         "query_description":     desc,
                         "query_result_metadata": query_result.get("query_result_metadata", {}),
                         "statement_response": {
                             "result": {
                                 "data_array": rows,
-                                "schema": {
-                                    "columns": cols
-                                }
+                                "schema": {"columns": cols}
                             }
                         },
                         **({"raw_sql_markdown": markdown_sql} if markdown_sql else {})
                     }
 
-                    # log it so you can confirm in your container logs
                     logger.debug("🚀 FINAL GENIE PAYLOAD: %s", final_payload)
-
                     return json.dumps(final_payload), conversation_id
 
 
