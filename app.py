@@ -279,21 +279,39 @@ async def ask_genie(
 def process_query_results_card(answer_json: Dict) -> Attachment:
     # pull out the pieces
     desc     = answer_json.get("query_description", "")
-    meta     = answer_json.get("query_result_metadata", {})
     stmt     = answer_json.get("statement_response", {})
     rows     = stmt.get("result", {}).get("data_array", [])
     cols     = stmt.get("manifest", {}).get("schema", {}).get("columns", [])
     raw_sql  = answer_json.get("raw_sql", "")
 
-    # build a simple markdown table if you like, else omit table.
-    table_md = ""
-    if rows and cols:
-        header = "| " + " | ".join(c["name"] for c in cols) + " |"
-        sep    = "|" + "|".join(" --- " for _ in cols) + "|"
-        lines  = [header, sep]
-        for row in rows:
-            lines.append("| " + " | ".join(str(v) for v in row) + " |")
-        table_md = "\n".join(lines)
+    # build header columns
+    header_columns = [
+        {
+            "type": "Column",
+            "width": "stretch",
+            "items": [
+                {"type": "TextBlock", "text": col["name"], "weight": "Bolder", "wrap": True}
+            ]
+        }
+        for col in cols
+    ]
+
+    # build a list of ColumnSet objects—one per row
+    data_rows = []
+    for row in rows:
+        data_rows.append({
+            "type": "ColumnSet",
+            "columns": [
+                {
+                    "type": "Column",
+                    "width": "stretch",
+                    "items": [
+                        {"type": "TextBlock", "text": str(val), "wrap": True}
+                    ]
+                }
+                for val in row
+            ]
+        })
 
     # adaptive card JSON
     card = {
@@ -301,21 +319,27 @@ def process_query_results_card(answer_json: Dict) -> Attachment:
       "type": "AdaptiveCard",
       "version": "1.5",
       "body": [
-        {"type": "TextBlock", "text": "**Query Description**", "weight": "Bolder"},
+        # Query Description
+        {"type": "TextBlock", "text": "Query Description", "weight": "Bolder"},
         {"type": "TextBlock", "text": desc, "wrap": True},
-        {"type": "TextBlock", "text": "**Metadata**", "weight": "Bolder"},
-        {"type": "TextBlock", "text": f"Row Count: {meta.get('row_count', '?')},  Exec Time: {meta.get('execution_time_ms', '?')}ms", "wrap": True},
-      ] + (
-        [{"type": "TextBlock", "text": "**Results**", "weight": "Bolder"},
-         {"type": "TextBlock", "text": table_md, "wrap": True}]
-        if table_md else []
-      ) + [
+      ]
+      # only add table if we have columns + rows
+      + (
+        [
+          # column headers
+          {"type": "TextBlock", "text": "Results", "weight": "Bolder", "spacing": "Medium"},
+          {"type": "ColumnSet", "columns": header_columns},
+        ]
+        + data_rows
+      )
+      # SQL container (always present, even if no rows)
+      + [
         {
           "type": "Container",
           "id": "sqlContainer",
           "isVisible": False,
           "items": [
-            {"type": "TextBlock", "text": "**Generated SQL**", "weight": "Bolder"},
+            {"type": "TextBlock", "text": "Generated SQL", "weight": "Bolder"},
             {"type": "TextBlock", "text": raw_sql, "wrap": True}
           ]
         }
