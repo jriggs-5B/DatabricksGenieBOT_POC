@@ -268,27 +268,36 @@ async def ask_genie(
                             "</details>"
                         )
 
+                    return json.dumps({
+                        "query_description":      desc or "",
+                        "query_result_metadata":  query_result.get("query_result_metadata", {}),
+                        # pass through the helper’s own statement_response exactly:
+                        "statement_response":     query_result.get("statement_response", {}),
+                        # only include SQL block if we built one:
+                        **({"raw_sql_markdown": markdown_sql} if markdown_sql else {})
+                    }), conversation_id    
+
                     # ─────────────────────────────────────────────────────
                     # 3) Shape the JSON so process_query_results finds exactly:
                     #    statement_response.result.data_array
                     #    statement_response.result.schema.columns
                     # ─────────────────────────────────────────────────────
-                    rows = query_result["result"].get("data_array", [])
-                    cols = query_result["statement_response"]["manifest"]["schema"].get("columns", [])
+                    # rows = query_result["result"].get("data_array", [])
+                    # cols = query_result["statement_response"]["manifest"]["schema"].get("columns", [])
 
-                    payload = {
-                        "query_description":     desc or "",
-                        "query_result_metadata": {},
+                    # payload = {
+                    #     "query_description":     desc or "",
+                    #     "query_result_metadata": {},
 
-                        "statement_response": {
-                            "result": {
-                                "data_array": rows,
-                                "schema":     { "columns": cols },
-                            }
-                        },
+                    #     "statement_response": {
+                    #         "result": {
+                    #             "data_array": rows,
+                    #             "schema":     { "columns": cols },
+                    #         }
+                    #     },
 
-                        **({"raw_sql_markdown": markdown_sql} if markdown_sql else {}),
-                    }
+                    #     **({"raw_sql_markdown": markdown_sql} if markdown_sql else {}),
+                    # }
 
                     logger.debug("🚀 FINAL GENIE PAYLOAD: %r", payload)
                     return json.dumps(payload), conversation_id
