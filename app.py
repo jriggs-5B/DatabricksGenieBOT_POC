@@ -56,6 +56,7 @@ DATABRICKS_HOST = os.getenv("DATABRICKS_HOST")
 DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
 APP_ID = os.getenv("MicrosoftAppId", "")
 APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
+MAX_ROWS = 200
 
 workspace_client = WorkspaceClient(
     host=DATABRICKS_HOST,
@@ -244,25 +245,82 @@ async def ask_genie(
                     desc    = getattr(query_obj, "description", None) or ""
                     raw_sql = getattr(query_obj, "query",      None)
 
-                    # — fetch the actual result body —
-                    query_result = await loop.run_in_executor(
-                        None,
-                        get_attachment_query_result,
-                        space_id,
-                        conversation_id,
-                        message_id,
-                        attachment_id,
-                    )
+                    if raw_sql:
+                        raw_sql = raw_sql.strip().rstrip(";")
+                        raw_sql_limited = f"{raw_sql} LIMIT {MAX_ROWS + 1}"  # ask for one extra row
+                    else:
+                        raw_sql_limited = raw_sql
 
-                    logger.debug(f"🔍 query_result from helper: {query_result!r}")
+                    query_obj.query = raw_sql_limited
 
+
+                    # ──────────────────────────────────────────────────────────
+                    # 4) fetch, truncate, and handle “too large” errors
+                    # ──────────────────────────────────────────────────────────
+                    truncated = False
+                    try:
+                        # execute the limited SQL
+                        query_result = await loop.run_in_executor(
+                            None,
+                            get_attachment_query_result,
+                            space_id,
+                            conversation_id,
+                            message_id,
+                            attachment_id,
+                            # if your helper accepts override_sql:
+                            raw_sql_limited
+                        )
+
+                        # truncate client‑side if necessary
+                        rows = query_result["statement_response"]["result"].get("data_array", [])
+                        if len(rows) > MAX_ROWS:
+                            truncated = True
+                            query_result["statement_response"]["result"]["data_array"] = rows[:MAX_ROWS]
+
+                    except Exception as e:
+                        # catch “payload too large” or other errors
+                        logger.warning(f"Genie error or payload too large: {e}")
+                        truncated = True
+                        query_result = {
+                            "query_result_metadata": {},
+                            "statement_response": {
+                                "result": {"data_array": []},
+                                "manifest": {"schema": {"columns": []}}
+                            }
+                        }
+
+                    logger.debug(f"🔍 query_result after truncate/error: {query_result!r}")
+
+                    # build the JSON payload, including the `truncated` flag
                     return json.dumps({
-                        "query_description":      desc or "",
-                        "query_result_metadata":  query_result.get("query_result_metadata", {}),
-                        # pass through the helper’s own statement_response exactly:
-                        "statement_response":     query_result.get("statement_response", {}),
-                        "raw_sql":                raw_sql or ""
+                        "query_description": desc or "",
+                        "query_result_metadata": query_result.get("query_result_metadata", {}),
+                        "statement_response":    query_result.get("statement_response", {}),
+                        "raw_sql":               raw_sql or "",
+                        "raw_sql_executed":      raw_sql_limited or "",
+                        "truncated":             truncated
                     }), conversation_id
+
+                    # — fetch the actual result body —
+                    # query_result = await loop.run_in_executor(
+                    #     None,
+                    #     get_attachment_query_result,
+                    #     space_id,
+                    #     conversation_id,
+                    #     message_id,
+                    #     attachment_id,
+                    # )
+
+                    # logger.debug(f"🔍 query_result from helper: {query_result!r}")
+
+                    # return json.dumps({
+                    #     "query_description":      desc or "",
+                    #     "query_result_metadata":  query_result.get("query_result_metadata", {}),
+                    #     # pass through the helper’s own statement_response exactly:
+                    #     "statement_response":     query_result.get("statement_response", {}),
+                    #     "raw_sql":                raw_sql or "",
+                    #     "raw_sql_executed":       raw_sql_limited or ""
+                    # }), conversation_id
 
                     logger.debug("🚀 FINAL GENIE PAYLOAD: %r", payload)
                     return json.dumps(payload), conversation_id
@@ -310,12 +368,7 @@ def process_query_results(answer_json: Dict) -> str:
     sections: List[str] = []
     logger.info(f"Processing answer JSON: {answer_json}")
 
-    # 1) Query Description
-    desc = answer_json.get("query_description")
-    if desc:
-        sections.append(f"## Query Description\n\n{desc}\n")
-
-    # 2) Metadata (row_count, execution_time_ms)
+    # 1) Metadata (row_count, execution_time_ms)
     meta = answer_json.get("query_result_metadata", {})
     if isinstance(meta, dict):
         meta_bits = []
@@ -326,13 +379,26 @@ def process_query_results(answer_json: Dict) -> str:
         if meta_bits:
             sections.append("\n".join(meta_bits) + "\n")
 
-    # 3) Results table
+    # 2) Results table
     stmt = answer_json.get("statement_response", {})
     result = stmt.get("result", {})              # <-- this is the dict you saw
     rows   = result.get("data_array", [])
     # the schema columns live under manifest.schema.columns
     manifest = stmt.get("manifest", {})
     schema   = manifest.get("schema", {}).get("columns", [])
+
+    truncated = False
+    if len(rows) > MAX_ROWS:
+        truncated = True
+        rows = rows[:MAX_ROWS]
+
+    # 3) Query Description
+    truncated = answer_json.get("truncated", False)
+    desc = answer_json.get("query_description")
+    if truncated:
+        desc += f"\n\n*Showing first {MAX_ROWS} rows; results truncated.*"
+    if desc:
+        sections.append(f"## Query Description\n\n{desc}\n")
 
     if rows and schema:
         # build header
