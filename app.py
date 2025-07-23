@@ -267,8 +267,6 @@ async def ask_genie(
                             conversation_id,
                             message_id,
                             attachment_id,
-                            # if your helper accepts override_sql:
-                            raw_sql_limited
                         )
 
                         # truncate client‑side if necessary
