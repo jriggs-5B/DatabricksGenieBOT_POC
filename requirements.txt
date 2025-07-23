@@ -2,6 +2,7 @@
 aiohttp==3.12.14
 requests==2.32.4
 python-dotenv==1.1.1
+redis>=4.0
 
 # Bot Framework
 botbuilder-core==4.17.0
@@ -24,3 +25,7 @@ flask-cors==6.0.1   # only if you have a Flask route that needs cross-origin
 
 # (Optionally) Flask if you have any Flask endpoints
 flask==3.1.0        # if you’re actually using Flask anywhere
+
+# new charting deps
+dash>=2.0
+plotly>=5.0
