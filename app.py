@@ -273,22 +273,21 @@ async def ask_genie(
                     #    statement_response.result.data_array
                     #    statement_response.result.schema.columns
                     # ─────────────────────────────────────────────────────
-                    schema_cols = getattr(attachment, "statement_response", {}) \
-                                    .get("manifest", {}) \
-                                    .get("schema", {}) \
-                                    .get("columns", [])
+                    rows = query_result["result"].get("data_array", [])
+                    cols = query_result["statement_response"]["manifest"]["schema"].get("columns", [])
 
                     payload = {
                         "query_description":     desc or "",
-                        "query_result_metadata": {},        # your helper isn’t returning any top‑level metadata
+                        "query_result_metadata": {},
+
                         "statement_response": {
                             "result": {
-                                "data_array": query_result.get("data_array", []),
-                                # shove the columns list into .schema.columns
-                                "schema":     { "columns": schema_cols },
+                                "data_array": rows,
+                                "schema":     { "columns": cols },
                             }
                         },
-                        **({"raw_sql_markdown": markdown_sql} if markdown_sql else {})
+
+                        **({"raw_sql_markdown": markdown_sql} if markdown_sql else {}),
                     }
 
                     logger.debug("🚀 FINAL GENIE PAYLOAD: %r", payload)
