@@ -390,9 +390,15 @@ def build_sql_toggle_card(
       # start with just the Show SQL button
       "actions": [
         {
-          "type": "Action.ToggleVisibility",
-          "title": "Show SQL",
-          "targetElements": ["sqlContainer"]
+            "type": "Action.ToggleVisibility",
+            "title": "Show SQL",
+            "targetElements": ["sqlContainer"]
+        },
+
+        {
+            "type":  "Action.OpenUrl",
+            "title": "Show Chart",
+            "url":   f"http://localhost:8050/chart?session={conversation_id}"
         }
       ]
     }
@@ -510,9 +516,12 @@ class MyBot(ActivityHandler):
 
             # 3a) send plain‑text markdown (description + results)
             plain_markdown = process_query_results(answer_json)
-            await turn_context.send_activity(plain_markdown)
 
             plain_markdown += f"\n\n*Session ID: `{new_conversation_id}`*"
+
+            await turn_context.send_activity(plain_markdown)
+
+            
 
             # 3b) send only the SQL toggle card
             raw_sql = answer_json.get("raw_sql", "")
