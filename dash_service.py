@@ -79,5 +79,5 @@ def update_chart(chart_type, url_search):
 
 if __name__ == "__main__":
     # Use DASH_PORT env var or default to 8050
-    port = int(os.getenv("DASH_PORT", 8050))
+    port = int(os.getenv("PORT", os.getenv("DASH_PORT", 8050)))
     server.run(host="0.0.0.0", port=port)
