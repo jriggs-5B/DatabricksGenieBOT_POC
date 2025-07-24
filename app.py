@@ -60,6 +60,8 @@ APP_ID = os.getenv("MicrosoftAppId", "")
 APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
 MAX_ROWS = 200
 SESSION_FILES: Dict[str, str] = {}
+# In‑memory store for full Genie JSON per session
+SESSION_DATA: Dict[str, Dict] = {}
 
 workspace_client = WorkspaceClient(
     host=DATABRICKS_HOST,
@@ -326,18 +328,33 @@ async def ask_genie(
 
                     logger.debug(f"🔍 query_result after truncate/error: {query_result!r}")
 
-                    # build the JSON payload, including the `truncated` flag
-                    return json.dumps({
+                    # # build the JSON payload, including the `truncated` flag
+                    # return json.dumps({
+                    #     "query_description": desc or "",
+                    #     "query_result_metadata": query_result.get("query_result_metadata", {}),
+                    #     "statement_response":    query_result.get("statement_response", {}),
+                    #     "raw_sql":               raw_sql or "",
+                    #     "raw_sql_executed":      raw_sql_limited or "",
+                    #     "truncated":             truncated
+                    # }), conversation_id
+
+                    # Build the answer JSON dict
+                    answer_json = {
                         "query_description": desc or "",
                         "query_result_metadata": query_result.get("query_result_metadata", {}),
                         "statement_response":    query_result.get("statement_response", {}),
                         "raw_sql":               raw_sql or "",
                         "raw_sql_executed":      raw_sql_limited or "",
                         "truncated":             truncated
-                    }), conversation_id
+                    }
+                    # Store for Dash to fetch later
+                    logger.debug("🚀 FINAL GENIE PAYLOAD: %r", answer_json)
+                    SESSION_DATA[conversation_id] = answer_json
+                    
+                    return json.dumps(answer_json), conversation_id
 
-                    logger.debug("🚀 FINAL GENIE PAYLOAD: %r", payload)
-                    return json.dumps(payload), conversation_id
+                    # logger.debug("🚀 FINAL GENIE PAYLOAD: %r", payload)
+                    # return json.dumps(payload), conversation_id
 
         # ────────────────
         # Fallback if no attachments at all
@@ -495,6 +512,8 @@ class MyBot(ActivityHandler):
             plain_markdown = process_query_results(answer_json)
             await turn_context.send_activity(plain_markdown)
 
+            plain_markdown += f"\n\n*Session ID: `{new_conversation_id}`*"
+
             # 3b) send only the SQL toggle card
             raw_sql = answer_json.get("raw_sql", "")
             conversation  = self.conversation_ids[user_id]
@@ -566,6 +585,18 @@ async def download_csv(request: web.Request) -> web.Response:
     )
 
 app.router.add_get("/download_csv", download_csv)
+
+# ────────────────────────────────────────────────────────────────
+# New: serve full Genie JSON for a session
+# ────────────────────────────────────────────────────────────────
+async def download_json(request: web.Request) -> web.Response:
+    session = request.query.get("session")
+    data    = SESSION_DATA.get(session)
+    if not data:
+        return web.Response(status=404, text="No data for that session.")
+    return web.json_response(data)
+
+app.router.add_get("/download_json", download_json)
 
 # ────────────────────────────────────────────────────────────
 # App start
