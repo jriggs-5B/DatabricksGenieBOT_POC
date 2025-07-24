@@ -17,8 +17,6 @@ import os
 import json
 import logging
 import time
-import tempfile
-import csv
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from aiohttp import web
@@ -58,8 +56,6 @@ DATABRICKS_HOST = os.getenv("DATABRICKS_HOST")
 DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
 APP_ID = os.getenv("MicrosoftAppId", "")
 APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
-MAX_ROWS = 200
-SESSION_FILES: Dict[str, str] = {}
 
 workspace_client = WorkspaceClient(
     host=DATABRICKS_HOST,
@@ -248,92 +244,24 @@ async def ask_genie(
                     desc    = getattr(query_obj, "description", None) or ""
                     raw_sql = getattr(query_obj, "query",      None)
 
-                    if raw_sql:
-                        raw_sql = raw_sql.strip().rstrip(";")
-                        raw_sql_limited = f"{raw_sql} LIMIT {MAX_ROWS + 1}"  # ask for one extra row
-                    else:
-                        raw_sql_limited = raw_sql
-
-                    # ───────────────────────────────────────────────────────
-                    # A) fetch and cache the full resultset as CSV
-                    # ───────────────────────────────────────────────────────
-                    # 1) temporarily override the query to be the full SQL
-                    query_obj.query = raw_sql
-
-                    # 2) ask Genie for the full rows
-                    full_result = await loop.run_in_executor(
+                    # — fetch the actual result body —
+                    query_result = await loop.run_in_executor(
                         None,
                         get_attachment_query_result,
                         space_id,
                         conversation_id,
                         message_id,
-                        attachment_id
+                        attachment_id,
                     )
-                    full_rows  = full_result["statement_response"]["result"]["data_array"]
-                    full_schema= full_result["statement_response"]["manifest"]["schema"]["columns"]
 
-                    # 3) write them to a temp CSV file
-                    tf = tempfile.NamedTemporaryFile(
-                        mode="w", newline="", delete=False, suffix=".csv", dir="/tmp"
-                    )
-                    writer = csv.writer(tf)
-                    # header row
-                    writer.writerow([col["name"] for col in full_schema])
-                    # data rows
-                    for row in full_rows:
-                        writer.writerow(row)
-                    tf.close()
+                    logger.debug(f"🔍 query_result from helper: {query_result!r}")
 
-                    # 4) record the file path for this session
-                    SESSION_FILES[conversation_id] = tf.name
-
-                    # ──────────────────────────────────────────────────────────
-                    # 4) fetch, truncate, and handle “too large” errors
-                    # ──────────────────────────────────────────────────────────
-                    query_obj.query = raw_sql_limited
-
-                    truncated = False
-                    try:
-                        # execute the limited SQL
-                        query_result = await loop.run_in_executor(
-                            None,
-                            get_attachment_query_result,
-                            space_id,
-                            conversation_id,
-                            message_id,
-                            attachment_id,
-                        )
-
-                        # truncate client‑side if necessary
-                        rows = query_result["statement_response"]["result"].get("data_array", [])
-
-                        truncated = False
-                        if len(rows) > MAX_ROWS:
-                            truncated = True
-                            query_result["statement_response"]["result"]["data_array"] = rows[:MAX_ROWS]
-
-                    except Exception as e:
-                        # catch “payload too large” or other errors
-                        logger.warning(f"Genie error or payload too large: {e}")
-                        truncated = True
-                        query_result = {
-                            "query_result_metadata": {},
-                            "statement_response": {
-                                "result": {"data_array": []},
-                                "manifest": {"schema": {"columns": []}}
-                            }
-                        }
-
-                    logger.debug(f"🔍 query_result after truncate/error: {query_result!r}")
-
-                    # build the JSON payload, including the `truncated` flag
                     return json.dumps({
-                        "query_description": desc or "",
-                        "query_result_metadata": query_result.get("query_result_metadata", {}),
-                        "statement_response":    query_result.get("statement_response", {}),
-                        "raw_sql":               raw_sql or "",
-                        "raw_sql_executed":      raw_sql_limited or "",
-                        "truncated":             truncated
+                        "query_description":      desc or "",
+                        "query_result_metadata":  query_result.get("query_result_metadata", {}),
+                        # pass through the helper’s own statement_response exactly:
+                        "statement_response":     query_result.get("statement_response", {}),
+                        "raw_sql":                raw_sql or ""
                     }), conversation_id
 
                     logger.debug("🚀 FINAL GENIE PAYLOAD: %r", payload)
@@ -349,12 +277,7 @@ async def ask_genie(
         return json.dumps({"error": "An error occurred while processing your request."}), conversation_id
 
 
-def build_sql_toggle_card(
-    raw_sql: str,
-    conversation_id: str,
-    truncated: bool
-) -> Attachment:
-    # 1) base card
+def build_sql_toggle_card(raw_sql: str) -> Attachment:
     card = {
       "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
       "type": "AdaptiveCard",
@@ -365,12 +288,11 @@ def build_sql_toggle_card(
           "id": "sqlContainer",
           "isVisible": False,
           "items": [
-            {"type": "TextBlock", "text": "**Generated SQL**", "weight": "Bolder"},
-            {"type": "TextBlock", "text": raw_sql, "wrap": True}
+            { "type": "TextBlock", "text": "**Generated SQL**", "weight": "Bolder" },
+            { "type": "TextBlock", "text": raw_sql, "wrap": True }
           ]
         }
       ],
-      # start with just the Show SQL button
       "actions": [
         {
           "type": "Action.ToggleVisibility",
@@ -379,16 +301,6 @@ def build_sql_toggle_card(
         }
       ]
     }
-
-    # 2) conditionally add the Download CSV button
-    if truncated:
-        card["actions"].append({
-          "type":  "Action.OpenUrl",
-          "title": "Download CSV",
-          "url":   f"poc-genie-web-app-hwerdjfpauehcxa4.eastus-01.azurewebsites.net/download_csv?session={conversation_id}"
-        })
-
-    # 3) wrap and return
     return Attachment(
       content_type="application/vnd.microsoft.card.adaptive",
       content=card
@@ -398,7 +310,12 @@ def process_query_results(answer_json: Dict) -> str:
     sections: List[str] = []
     logger.info(f"Processing answer JSON: {answer_json}")
 
-    # 1) Metadata (row_count, execution_time_ms)
+    # 1) Query Description
+    desc = answer_json.get("query_description")
+    if desc:
+        sections.append(f"## Query Description\n\n{desc}\n")
+
+    # 2) Metadata (row_count, execution_time_ms)
     meta = answer_json.get("query_result_metadata", {})
     if isinstance(meta, dict):
         meta_bits = []
@@ -409,26 +326,13 @@ def process_query_results(answer_json: Dict) -> str:
         if meta_bits:
             sections.append("\n".join(meta_bits) + "\n")
 
-    # 2) Results table
+    # 3) Results table
     stmt = answer_json.get("statement_response", {})
     result = stmt.get("result", {})              # <-- this is the dict you saw
     rows   = result.get("data_array", [])
     # the schema columns live under manifest.schema.columns
     manifest = stmt.get("manifest", {})
     schema   = manifest.get("schema", {}).get("columns", [])
-
-    truncated = False
-    if len(rows) > MAX_ROWS:
-        truncated = True
-        rows = rows[:MAX_ROWS]
-
-    # 3) Query Description
-    truncated = answer_json.get("truncated", False)
-    desc = answer_json.get("query_description")
-    if truncated:
-        desc += f"\n\n*Showing first {MAX_ROWS} rows; results truncated.*"
-    if desc:
-        sections.append(f"## Query Description\n\n{desc}\n")
 
     if rows and schema:
         # build header
@@ -497,10 +401,7 @@ class MyBot(ActivityHandler):
 
             # 3b) send only the SQL toggle card
             raw_sql = answer_json.get("raw_sql", "")
-            conversation  = self.conversation_ids[user_id]
-            truncated     = answer_json.get("truncated", False)
-
-            sql_card = build_sql_toggle_card(raw_sql, conversation, truncated)
+            sql_card = build_sql_toggle_card(raw_sql)
             await turn_context.send_activity(
                 MessageFactory.attachment(sql_card)
             )
@@ -545,31 +446,6 @@ async def messages(req: web.Request) -> web.Response:
         return web.Response(status=500)
 
 app.router.add_post("/api/messages", messages)
-
-# ────────────────────────────────────────────────────────────
-# New: CSV download endpoint
-# ────────────────────────────────────────────────────────────
-async def download_csv(request: web.Request) -> web.Response:
-    session = request.query.get("session")
-    path    = SESSION_FILES.get(session)
-    if not path or not os.path.exists(path):
-        return web.Response(status=404, text="No data for that session.")
-
-    # Clean up after serving:
-    del SESSION_FILES[session]
-
-    return web.FileResponse(
-        path,
-        headers={
-            "Content-Disposition": f"attachment; filename=\"results_{session}.csv\""
-        }
-    )
-
-app.router.add_get("/download_csv", download_csv)
-
-# ────────────────────────────────────────────────────────────
-# App start
-# ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     try:
