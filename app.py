@@ -556,7 +556,7 @@ async def download_csv(request: web.Request) -> web.Response:
         return web.Response(status=404, text="No data for that session.")
 
     # Clean up after serving:
-    del SESSION_FILES[session]
+    # del SESSION_FILES[session]
 
     return web.FileResponse(
         path,
