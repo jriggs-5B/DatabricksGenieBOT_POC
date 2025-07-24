@@ -3,10 +3,13 @@ import json
 import requests
 import pandas as pd
 from flask import Flask, request
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, dcc, html, Input, Output, State
+import logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger("dash_service")
 
 # URL where your bot is listening (override via env var if needed)
-BOT_URL = os.getenv("BOT_URL", "http://bot-service:8181")
+BOT_URL = os.environ["BOT_URL"]
 
 # Flask server to host Dash
 server = Flask(__name__)
@@ -20,6 +23,9 @@ dash_app = Dash(
 )
 
 dash_app.layout = html.Div([
+    # This component lets you read the URL (including query string)
+    dcc.Location(id="url", refresh=False),
+
     html.H2("Genie Results Chart"),
     dcc.Dropdown(
         id="chart-type",
@@ -36,32 +42,40 @@ dash_app.layout = html.Div([
 
 @dash_app.callback(
     Output("main-chart", "figure"),
-    Input("chart-type", "value"),
+    # Input drives the callback; State carries the URL in silently
+    [Input("chart-type", "value")],
+    [State("url", "search")]
 )
-def update_chart(chart_type):
-    # 1) Fetch the full Genie JSON from your bot
-    session = request.args.get("session")
+def update_chart(chart_type, url_search):
+    import urllib.parse
+
+    # parse out ?session=xxx
+    query = urllib.parse.parse_qs((url_search or "").lstrip("?"))
+    session = query.get("session", [None])[0]
+    logger.debug(f"🛰️  Dash fetching JSON for session={session}")
+
+    # fetch data
     resp = requests.get(f"{BOT_URL}/download_json", params={"session": session})
-    if resp.status_code != 200:
+    logger.debug(f"🛰️  Response {resp.status_code}: {resp.text[:200]}…")
+
+    if resp.status_code != 200 or not session:
+        # nothing to chart
         return {"data": []}
 
-    answer_json = resp.json()
-
-    # 2) Build DataFrame from the returned rows & schema
-    cols = [c["name"] for c in answer_json["statement_response"]["manifest"]["schema"]["columns"]]
-    rows = answer_json["statement_response"]["result"]["data_array"]
+    data = resp.json()
+    cols = [c["name"] for c in data["statement_response"]["manifest"]["schema"]["columns"]]
+    rows = data["statement_response"]["result"]["data_array"]
     df   = pd.DataFrame(rows, columns=cols)
 
-    # 3) Render the selected chart type
     x, y = df.columns[:2]
     if chart_type == "bar":
-        fig = {"data": [{"type": "bar",   "x": df[x], "y": df[y]}]}
+        fig_data = [{"type": "bar",  "x": df[x], "y": df[y]}]
     elif chart_type == "line":
-        fig = {"data": [{"type": "line",  "x": df[x], "y": df[y]}]}
+        fig_data = [{"type": "line", "x": df[x], "y": df[y]}]
     else:
-        fig = {"data": [{"type": "pie",   "labels": df[x], "values": df[y]}]}
+        fig_data = [{"type": "pie",  "labels": df[x], "values": df[y]}]
 
-    return fig
+    return {"data": fig_data}
 
 if __name__ == "__main__":
     # Use DASH_PORT env var or default to 8050

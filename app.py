@@ -62,6 +62,8 @@ MAX_ROWS = 200
 SESSION_FILES: Dict[str, str] = {}
 # In‑memory store for full Genie JSON per session
 SESSION_DATA: Dict[str, Dict] = {}
+DASH_URL = os.environ["DASH_URL"]
+BOT_URL = os.environ["BOT_URL"]
 
 workspace_client = WorkspaceClient(
     host=DATABRICKS_HOST,
@@ -398,7 +400,7 @@ def build_sql_toggle_card(
         {
             "type":  "Action.OpenUrl",
             "title": "Show Chart",
-            "url":   f"http://localhost:8050/chart?session={conversation_id}"
+            "url":   f"{DASH_URL}/chart?session={conversation_id}"
         }
       ]
     }
@@ -408,7 +410,7 @@ def build_sql_toggle_card(
         card["actions"].append({
           "type":  "Action.OpenUrl",
           "title": "Download CSV",
-          "url":   f"https://poc-genie-web-app-hwerdjfpauehcxa4.eastus-01.azurewebsites.net/download_csv?session={conversation_id}"
+          "url":   f"{BOT_URL}/download_csv?session={conversation_id}"
         })
 
     # 3) wrap and return
