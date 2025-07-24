@@ -385,7 +385,7 @@ def build_sql_toggle_card(
         card["actions"].append({
           "type":  "Action.OpenUrl",
           "title": "Download CSV",
-          "url":   f"poc-genie-web-app-hwerdjfpauehcxa4.eastus-01.azurewebsites.net/download_csv?session={conversation_id}"
+          "url":   f"https://poc-genie-web-app-hwerdjfpauehcxa4.eastus-01.azurewebsites.net/download_csv?session={conversation_id}"
         })
 
     # 3) wrap and return
