@@ -28,11 +28,33 @@ dash_app.layout = html.Div([
     dcc.Location(id="url", refresh=False),
 
     html.Div(
-        html.Img(src="/assets/5B_logo_medallion.png", style={"height": "60px"}),
-        style={"textAlign": "center", "padding": "10px 0"}
+        style={
+            "display": "flex",
+            "alignItems": "center",
+            "justifyContent": "center",
+            "padding": "10px 0"
+        },
+        children=[
+            # 1) Logo on the left
+            html.Img(
+                src="/assets/5B_Logo_Medallion.png",
+                style={"height": "60px", "marginRight": "20px"}
+            ),
+            # 2) Title on the right
+            html.H2(
+                "Supply Chain KNOWLEDGE Agent Results Visualization",
+                style={"margin": 0}
+            ),
+        ],
     ),
+    
+    # html.Div(
+    #     html.Img(src="/assets/5B_Logo_Medallion.png", style={"height": "60px"}),
+    #     style={"textAlign": "center", "padding": "10px 0"}
+    # ),
 
-    html.H2("Supply Chain KNOWLEDGE Agent Results Visuaization"),
+    # html.H2("Supply Chain KNOWLEDGE Agent Results Visualization"),
+
     dcc.Dropdown(
         id="chart-type",
         options=[
