@@ -37,7 +37,7 @@ dash_app.layout = html.Div([
         children=[
             # 1) Logo on the left
             html.Img(
-                src="/assets/5B_Logo_Medallion.png",
+                src=dash_app.get_asset_url("5B_Logo_Medallion.png"),
                 style={"height": "60px", "marginRight": "20px"}
             ),
             # 2) Title on the right
@@ -118,7 +118,14 @@ def update_chart_and_table(chart_type, url_search):
         fig_data = [{"type": "line", "x": df[x], "y": df[y]}]
     else:
         fig_data = [{"type": "pie",  "labels": df[x], "values": df[y]}]
-    fig = {"data": data, "layout": {"margin": {"t": 30, "b": 30}}}
+    fig = {
+        "data": fig_data,
+        "layout": {"margin": {"t": 30, "b": 30}}
+    }
+    fig["layout"].update({
+    "xaxis": {"title": x},
+    "yaxis": {"title": y}
+    })
 
     # prepare table columns+data
     table_columns = [{"name": c, "id": c} for c in df.columns]
