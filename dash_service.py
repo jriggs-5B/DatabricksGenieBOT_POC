@@ -66,10 +66,23 @@ dash_app.layout = html.Div([
         clearable=False,
         style={"width": "200px", "margin": "0 auto 20px auto"},
     ),
+
+    # 2) X‑column selector
+    html.Div([
+        html.Label("X‑axis:"),
+        dcc.Dropdown(id="x-col", clearable=False)
+    ], style={"display":"inline-block","width":"40%","margin":"0 5%"}),
+
+    # 3) Y‑column selector
+    html.Div([
+        html.Label("Y‑axis:"),
+        dcc.Dropdown(id="y-col", clearable=False)
+    ], style={"display":"inline-block","width":"40%","margin":"0 5%"}),
+
     dcc.Graph(id="main-chart"),
 
      # 4) Data table placeholder
-    html.H3("Underlying Data"),
+    html.H3("Underlying Data", style={"textAlign":"center","marginTop":"40px"}),
     dash_table.DataTable(
         id="data-table",
         columns=[],   # will be set in callback
@@ -79,18 +92,53 @@ dash_app.layout = html.Div([
         style_cell={"textAlign": "left", "padding": "5px"},
     ),
 ])
+# 1) Populate x‑col and y‑col options + initial values once we know the session
 
 @dash_app.callback(
     [
-        Output("main-chart", "figure"),
-        Output("data-table", "columns"),
-        Output("data-table", "data"),
+      Output("x-col", "options"),
+      Output("x-col", "value"),
+      Output("y-col", "options"),
+      Output("y-col", "value"),
     ],
-    [Input("chart-type", "value")],
+    Input("url", "search")
+)
+def populate_column_dropdowns(url_search):
+    import urllib.parse
+    query   = urllib.parse.parse_qs((url_search or "").lstrip("?"))
+    session = query.get("session", [None])[0]
+
+    # fetch the raw JSON once
+    resp = requests.get(f"{BOT_URL}/download_json", params={"session": session})
+    if resp.status_code != 200:
+        return [], None, [], None
+
+    j = resp.json()
+    cols = [c["name"] for c in j["statement_response"]["manifest"]["schema"]["columns"]]
+    options = [{"label": c, "value": c} for c in cols]
+
+    # default to first two columns if available
+    x0 = cols[0] if len(cols) > 0 else None
+    y0 = cols[1] if len(cols) > 1 else None
+
+    return options, x0, options, y0
+
+
+@dash_app.callback(
+    [
+      Output("main-chart", "figure"),
+      Output("data-table", "columns"),
+      Output("data-table", "data"),
+    ],
+    [
+      Input("chart-type", "value"),
+      Input("x-col",       "value"),
+      Input("y-col",       "value"),
+    ],
     [State("url", "search")]
 )
 
-def update_chart_and_table(chart_type, url_search):
+def update_chart_and_table(chart_type, x_col, y_col, url_search):
     import urllib.parse
 
     # parse out ?session=xxx
@@ -118,10 +166,16 @@ def update_chart_and_table(chart_type, url_search):
         fig_data = [{"type": "line", "x": df[x], "y": df[y]}]
     else:
         fig_data = [{"type": "pie",  "labels": df[x], "values": df[y]}]
+
     fig = {
-        "data": fig_data,
-        "layout": {"margin": {"t": 30, "b": 30}}
+      "data": fig_data,
+      "layout": {
+        "margin": {"t": 30, "b": 50},
+        "xaxis": {"title": x_col, "tickangle": -45},
+        "yaxis": {"title": y_col},
+      }  
     }
+
     fig["layout"].update({
     "xaxis": {"title": x},
     "yaxis": {"title": y}
