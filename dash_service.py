@@ -3,8 +3,9 @@ import json
 import requests
 import pandas as pd
 from flask import Flask, request
-from dash import Dash, dcc, html, Input, Output, State
+from dash import Dash, dcc, html, Input, Output, State, dash_table
 import logging
+
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("dash_service")
 
@@ -26,7 +27,12 @@ dash_app.layout = html.Div([
     # This component lets you read the URL (including query string)
     dcc.Location(id="url", refresh=False),
 
-    html.H2("Genie Results Chart"),
+    html.Div(
+        html.Img(src="/assets/5B_logo_medallion.png", style={"height": "60px"}),
+        style={"textAlign": "center", "padding": "10px 0"}
+    ),
+
+    html.H2("Supply Chain KNOWLEDGE Agent Results Visuaization"),
     dcc.Dropdown(
         id="chart-type",
         options=[
@@ -36,17 +42,33 @@ dash_app.layout = html.Div([
         ],
         value="bar",
         clearable=False,
+        style={"width": "200px", "margin": "0 auto 20px auto"},
     ),
     dcc.Graph(id="main-chart"),
+
+     # 4) Data table placeholder
+    html.H3("Underlying Data"),
+    dash_table.DataTable(
+        id="data-table",
+        columns=[],   # will be set in callback
+        data=[],      # will be set in callback
+        page_size=10,
+        style_table={"overflowX": "auto"},
+        style_cell={"textAlign": "left", "padding": "5px"},
+    ),
 ])
 
 @dash_app.callback(
-    Output("main-chart", "figure"),
-    # Input drives the callback; State carries the URL in silently
+    [
+        Output("main-chart", "figure"),
+        Output("data-table", "columns"),
+        Output("data-table", "data"),
+    ],
     [Input("chart-type", "value")],
     [State("url", "search")]
 )
-def update_chart(chart_type, url_search):
+
+def update_chart_and_table(chart_type, url_search):
     import urllib.parse
 
     # parse out ?session=xxx
@@ -74,8 +96,13 @@ def update_chart(chart_type, url_search):
         fig_data = [{"type": "line", "x": df[x], "y": df[y]}]
     else:
         fig_data = [{"type": "pie",  "labels": df[x], "values": df[y]}]
+    fig = {"data": data, "layout": {"margin": {"t": 30, "b": 30}}}
 
-    return {"data": fig_data}
+    # prepare table columns+data
+    table_columns = [{"name": c, "id": c} for c in df.columns]
+    table_data    = df.to_dict("records")
+
+    return fig, table_columns, table_data
 
 if __name__ == "__main__":
     # Use DASH_PORT env var or default to 8050
