@@ -163,13 +163,12 @@ def update_chart_and_table(chart_type, x_col, y_col, url_search):
     logger.debug("DF columns: %r", list(df.columns))
     logger.debug("Requested x_col=%r, y_col=%r", x_col, y_col)
 
-    x, y = df.columns[:2]
     if chart_type == "bar":
-        fig_data = [{"type": "bar",  "x": df[x], "y": df[y]}]
+        fig_data = [{"type": "bar",  "x": df[x_col], "y": df[y_col]}]
     elif chart_type == "line":
-        fig_data = [{"type": "line", "x": df[x], "y": df[y]}]
+        fig_data = [{"type": "line", "x": df[x_col], "y": df[y_col]}]
     else:
-        fig_data = [{"type": "pie",  "labels": df[x], "values": df[y]}]
+        fig_data = [{"type": "pie",  "labels": df[x_col], "values": df[y_col]}]
 
     fig = {
       "data": fig_data,
@@ -179,11 +178,6 @@ def update_chart_and_table(chart_type, x_col, y_col, url_search):
         "yaxis": {"title": y_col},
       }  
     }
-
-    fig["layout"].update({
-    "xaxis": {"title": x},
-    "yaxis": {"title": y}
-    })
 
     # prepare table columns+data
     table_columns = [{"name": c, "id": c} for c in df.columns]
