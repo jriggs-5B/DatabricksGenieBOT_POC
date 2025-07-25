@@ -139,6 +139,7 @@ def populate_column_dropdowns(url_search):
 )
 
 def update_chart_and_table(chart_type, x_col, y_col, url_search):
+    logger.debug(f"Inputs → chart={chart_type!r}, x_col={x_col!r}, y_col={y_col!r}, url={url_search!r}")
     import urllib.parse
 
     # parse out ?session=xxx
