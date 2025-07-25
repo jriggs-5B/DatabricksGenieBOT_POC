@@ -160,6 +160,9 @@ def update_chart_and_table(chart_type, x_col, y_col, url_search):
     rows = data["statement_response"]["result"]["data_array"]
     df   = pd.DataFrame(rows, columns=cols)
 
+    logger.debug("DF columns: %r", list(df.columns))
+    logger.debug("Requested x_col=%r, y_col=%r", x_col, y_col)
+
     x, y = df.columns[:2]
     if chart_type == "bar":
         fig_data = [{"type": "bar",  "x": df[x], "y": df[y]}]
