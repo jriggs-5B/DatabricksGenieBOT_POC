@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 # only need the dash service file
 COPY dash_service.py .  
+COPY assets/ ./assets/
 
 ENV DASH_PORT=8050
 EXPOSE 8050
