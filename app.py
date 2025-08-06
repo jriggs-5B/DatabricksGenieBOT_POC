@@ -505,16 +505,19 @@ class MyBot(ActivityHandler):
 
     async def on_message_activity(self, turn_context: TurnContext):
         user_id = turn_context.activity.from_property.id
+        await turn_context.send_activity(MessageFactory.text("Processing request…"))
 
         state = self.user_state.setdefault(user_id, {})
-        await turn_context.send_activity(Activity(type=ActivityTypes.typing))
+        # await turn_context.send_activity(Activity(type=ActivityTypes.typing))
         
-        if not state.get("did_ack"):
-            state["did_ack"] = True
-            # visible acknowledgement
-            await turn_context.send_activity(MessageFactory.text("Processing request…"))
+        # if not state.get("did_ack"):
+        #     state["did_ack"] = True
+        #     # visible acknowledgement
+        #     await turn_context.send_activity(MessageFactory.text("Processing request…"))
 
         question = turn_context.activity.text
+
+        await turn_context.send_activity(Activity(type=ActivityTypes.typing))
 
         try:
             # 1) call Genie
