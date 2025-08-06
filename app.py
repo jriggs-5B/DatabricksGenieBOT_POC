@@ -501,16 +501,16 @@ ADAPTER = BotFrameworkAdapter(SETTINGS)
 class MyBot(ActivityHandler):
     def __init__(self):
         self.conversation_ids: Dict[str, str] = {}
-        self.user_state: Dict[str, dict] = {}
+        self.user_state: Dict[str, Dict] = {}
 
     async def on_message_activity(self, turn_context: TurnContext):
         user_id = turn_context.activity.from_property.id
 
         state = self.user_state.setdefault(user_id, {})
+        await turn_context.send_activity(Activity(type=ActivityTypes.typing))
         
         if not state.get("did_ack"):
             state["did_ack"] = True
-            await turn_context.send_activity(Activity(type=ActivityTypes.typing))
             # visible acknowledgement
             await turn_context.send_activity(MessageFactory.text("Processing request…"))
 
