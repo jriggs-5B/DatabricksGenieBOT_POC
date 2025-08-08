@@ -505,7 +505,7 @@ class MyBot(ActivityHandler):
 
     async def on_message_activity(self, turn_context: TurnContext):
         user_id = turn_context.activity.from_property.id
-        await turn_context.send_activity(MessageFactory.text("Processing request…"))
+        # await turn_context.send_activity(MessageFactory.text("Processing request…"))
 
         state = self.user_state.setdefault(user_id, {})
         # await turn_context.send_activity(Activity(type=ActivityTypes.typing))
