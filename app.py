@@ -23,7 +23,7 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from aiohttp import web
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, ActivityHandler, TurnContext, MessageFactory
-from botbuilder.schema import Activity, ChannelAccount, Attachment
+from botbuilder.schema import Activity, ChannelAccount, Attachment, ActivityTypes
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.dashboards import GenieAPI, MessageStatus
 import asyncio
@@ -492,6 +492,8 @@ def process_query_results(answer_json: Dict) -> str:
     # stitch and return
     return "\n".join(sections)
 
+def safe_md(text: str) -> str:
+    return text.replace("|", "\\|").replace("_", "\\_")
 
 SETTINGS = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
 ADAPTER = BotFrameworkAdapter(SETTINGS)
@@ -499,10 +501,23 @@ ADAPTER = BotFrameworkAdapter(SETTINGS)
 class MyBot(ActivityHandler):
     def __init__(self):
         self.conversation_ids: Dict[str, str] = {}
+        self.user_state: Dict[str, Dict] = {}
 
     async def on_message_activity(self, turn_context: TurnContext):
         user_id = turn_context.activity.from_property.id
+        # await turn_context.send_activity(MessageFactory.text("Processing request…"))
+
+        state = self.user_state.setdefault(user_id, {})
+        # await turn_context.send_activity(Activity(type=ActivityTypes.typing))
+        
+        # if not state.get("did_ack"):
+        #     state["did_ack"] = True
+        #     # visible acknowledgement
+        #     await turn_context.send_activity(MessageFactory.text("Processing request…"))
+
         question = turn_context.activity.text
+
+        await turn_context.send_activity(Activity(type=ActivityTypes.typing))
 
         try:
             # 1) call Genie
