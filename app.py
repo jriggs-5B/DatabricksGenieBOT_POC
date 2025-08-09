@@ -28,6 +28,7 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.dashboards import GenieAPI, MessageStatus
 import asyncio
 import requests
+import re
 
 # Log for prod
 # logging.basicConfig(level=logging.INFO)
@@ -64,6 +65,9 @@ SESSION_FILES: Dict[str, str] = {}
 SESSION_DATA: Dict[str, Dict] = {}
 DASH_URL = os.environ["DASH_URL"]
 BOT_URL = os.environ["BOT_URL"]
+DATABRICKS_WAREHOUSE_ID = os.getenv("SQL_WAREHOUSE_ID")
+DATABRICKS_CATALOG = os.getenv("DATABRICKS_CATALOG")
+DATABRICKS_SCHEMA  = os.getenv("DATABRICKS_SCHEMA")
 
 workspace_client = WorkspaceClient(
     host=DATABRICKS_HOST,
@@ -172,8 +176,65 @@ def execute_attachment_query(space_id, conversation_id, message_id, attachment_i
     except Exception as e:
         logger.error(f"Failed to parse JSON from Genie API: {e}, text: {response.text}")
         return {}
+    
+def count_total_rows_via_sql_warehouse(raw_sql: str) -> Optional[int]:
+    """
+    Run: SELECT COUNT(*) FROM (<raw_sql>) t
+    against the Databricks SQL Statements API (warehouse).
+    Returns an int or None.
+    """
+    if not raw_sql or not DATABRICKS_WAREHOUSE_ID:
+        return None
 
+    submit_url = f"{DATABRICKS_HOST}/api/2.0/sql/statements"
+    headers = {
+        "Authorization": f"Bearer {DATABRICKS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    stmt = f"SELECT COUNT(*) AS total_count FROM (\n{raw_sql.strip().rstrip(';')}\n) t"
+    payload = {"statement": stmt, "warehouse_id": DATABRICKS_WAREHOUSE_ID}
+    if DATABRICKS_CATALOG:
+        payload["catalog"] = DATABRICKS_CATALOG
+    if DATABRICKS_SCHEMA:
+        payload["schema"] = DATABRICKS_SCHEMA
 
+    # submit
+    r = requests.post(submit_url, headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    statement_id = (r.json() or {}).get("statement_id")
+    if not statement_id:
+        return None
+
+    # poll
+    get_url = f"{submit_url}/{statement_id}"
+    for _ in range(60):  # up to ~60s
+        g = requests.get(get_url, headers=headers, timeout=15)
+        g.raise_for_status()
+        data = g.json() or {}
+        state = ((data.get("status") or {}).get("state")) or ""
+        if state in ("SUCCEEDED", "FAILED", "CANCELED"):
+            if state != "SUCCEEDED":
+                return None
+            res = data.get("result") or {}
+            arr = res.get("data_array") or []
+            if arr and isinstance(arr[0], (list, tuple)) and len(arr[0]) >= 1:
+                try:
+                    return int(arr[0][0])
+                except Exception:
+                    return None
+            return None
+        time.sleep(1)
+
+    return None
+
+# def build_count_sql(raw_sql: str) -> str:
+#     """
+#     Exact-count wrapper: do not strip anything except a trailing semicolon.
+#     """
+#     if not raw_sql:
+#         return "SELECT 0 AS total_count"
+#     sql = raw_sql.strip().rstrip(";")
+#     return f"SELECT COUNT(*) AS total_count FROM (\n{sql}\n) AS t"
 
 logger = logging.getLogger(__name__)
 
@@ -259,12 +320,14 @@ async def ask_genie(
                         raw_sql_limited = raw_sql
 
                     # ───────────────────────────────────────────────────────
-                    # A) fetch and cache the full resultset as CSV
+                    # A) FULL result (for CSV) — re-execute raw_sql, then fetch
                     # ───────────────────────────────────────────────────────
-                    # 1) temporarily override the query to be the full SQL
-                    query_obj.query = raw_sql
-
-                    # 2) ask Genie for the full rows
+                    await loop.run_in_executor(
+                        None,
+                        execute_attachment_query,
+                        space_id, conversation_id, message_id, attachment_id,
+                        {"query": raw_sql}
+                    )
                     full_result = await loop.run_in_executor(
                         None,
                         get_attachment_query_result,
@@ -273,8 +336,17 @@ async def ask_genie(
                         message_id,
                         attachment_id
                     )
-                    full_rows  = full_result["statement_response"]["result"]["data_array"]
-                    full_schema= full_result["statement_response"]["manifest"]["schema"]["columns"]
+                    full_stmt    = (full_result or {}).get("statement_response", {}) or {}
+                    full_rows    = ((full_stmt.get("result") or {}).get("data_array") or [])
+                    full_schema  = ((full_stmt.get("manifest") or {}).get("schema") or {}).get("columns", []) or []
+                    csv_rows     = len(full_rows)
+
+                    # Authoritative total via SQL Warehouse (independent of Genie)
+                    db_total_rows = await loop.run_in_executor(
+                        None,
+                        count_total_rows_via_sql_warehouse,
+                        raw_sql
+                    )
 
                     # 3) write them to a temp CSV file
                     tf = tempfile.NamedTemporaryFile(
@@ -292,34 +364,51 @@ async def ask_genie(
                     SESSION_FILES[conversation_id] = tf.name
 
                     # ──────────────────────────────────────────────────────────
-                    # 4) fetch, truncate, and handle “too large” errors
+                    # 4) LIMITED preview for Teams — execute limited SQL, fetch, compute sizes
                     # ──────────────────────────────────────────────────────────
-                    query_obj.query = raw_sql_limited
-
-                    truncated = False
                     try:
-                        # execute the limited SQL
+                        # Re-execute the limited SQL on this attachment
+                        await loop.run_in_executor(
+                        None,
+                        execute_attachment_query,
+                        space_id, conversation_id, message_id, attachment_id,
+                        {"query": raw_sql}
+                        )
+
+                        # Fetch the limited result
                         query_result = await loop.run_in_executor(
                             None,
                             get_attachment_query_result,
-                            space_id,
-                            conversation_id,
-                            message_id,
-                            attachment_id,
+                            space_id, conversation_id, message_id, attachment_id,
                         )
 
-                        # truncate client‑side if necessary
-                        rows = query_result["statement_response"]["result"].get("data_array", [])
-
-                        truncated = False
+                        # Normalize & enforce MAX_ROWS defensively
+                        rows = query_result["statement_response"]["result"].get("data_array", []) or []
                         if len(rows) > MAX_ROWS:
-                            truncated = True
-                            query_result["statement_response"]["result"]["data_array"] = rows[:MAX_ROWS]
+                            rows = rows[:MAX_ROWS]
+                            query_result["statement_response"]["result"]["data_array"] = rows
+
+                        shown_rows = len(rows)
+
+                        # Derive counts (handle missing COUNT by falling back to csv_rows)
+                        if db_total_rows is None:
+                            db_total_rows = csv_rows
+
+                        teams_truncated = max(csv_rows - shown_rows, 0)       # CSV → Teams
+                        csv_truncated   = max(db_total_rows - csv_rows, 0)    # DB → CSV (Genie cap)
+                        total_truncated = max(db_total_rows - shown_rows, 0)  # DB → Teams
+                        truncated       = total_truncated > 0
 
                     except Exception as e:
-                        # catch “payload too large” or other errors
                         logger.warning(f"Genie error or payload too large: {e}")
-                        truncated = True
+                        shown_rows = 0
+                        if db_total_rows is None:
+                            db_total_rows = 0
+                        csv_rows = 0
+                        teams_truncated = 0
+                        csv_truncated   = max(db_total_rows - csv_rows, 0)
+                        total_truncated = max(db_total_rows - shown_rows, 0)
+                        truncated       = total_truncated > 0
                         query_result = {
                             "query_result_metadata": {},
                             "statement_response": {
@@ -328,17 +417,11 @@ async def ask_genie(
                             }
                         }
 
-                    logger.debug(f"🔍 query_result after truncate/error: {query_result!r}")
+                    if db_total_rows is None or db_total_rows < csv_rows:
+                        logger.warning("Warehouse COUNT < CSV rows, correcting total to CSV size")
+                        db_total_rows = csv_rows
 
-                    # # build the JSON payload, including the `truncated` flag
-                    # return json.dumps({
-                    #     "query_description": desc or "",
-                    #     "query_result_metadata": query_result.get("query_result_metadata", {}),
-                    #     "statement_response":    query_result.get("statement_response", {}),
-                    #     "raw_sql":               raw_sql or "",
-                    #     "raw_sql_executed":      raw_sql_limited or "",
-                    #     "truncated":             truncated
-                    # }), conversation_id
+                    logger.debug(f"🔍 query_result after truncate/error: {query_result!r}")
 
                     # Build the answer JSON dict
                     answer_json = {
@@ -347,11 +430,27 @@ async def ask_genie(
                         "statement_response":    query_result.get("statement_response", {}),
                         "raw_sql":               raw_sql or "",
                         "raw_sql_executed":      raw_sql_limited or "",
-                        "truncated":             truncated
+                        "truncated":             truncated,
+
+                        # NEW: sizes
+                        "db_total_rows":   int(db_total_rows or 0),  # true total
+                        "csv_rows":        int(csv_rows or 0),       # rows in downloadable CSV
+                        "shown_rows":      int(shown_rows or 0),     # rows in Teams
+
+                        # NEW: breakdown
+                        "teams_truncated": int(teams_truncated or 0),  # csv_rows - shown_rows
+                        "csv_truncated":   int(csv_truncated or 0),    # db_total_rows - csv_rows
+                        "total_truncated": int(total_truncated or 0),  # db_total_rows - shown_rows
                     }
                     # Store for Dash to fetch later
                     logger.debug("🚀 FINAL GENIE PAYLOAD: %r", answer_json)
                     SESSION_DATA[conversation_id] = answer_json
+
+                    logger.info(
+                        "Sizes: db_total=%s csv=%s shown=%s | truncated total=%s (csv=%s, teams=%s)",
+                        answer_json["db_total_rows"], answer_json["csv_rows"], answer_json["shown_rows"],
+                        answer_json["total_truncated"], answer_json["csv_truncated"], answer_json["teams_truncated"]
+                    )
                     
                     return json.dumps(answer_json), conversation_id
 
@@ -442,18 +541,26 @@ def process_query_results(answer_json: Dict) -> str:
     manifest = stmt.get("manifest", {})
     schema   = manifest.get("schema", {}).get("columns", [])
 
-    truncated = False
-    if len(rows) > MAX_ROWS:
-        truncated = True
-        rows = rows[:MAX_ROWS]
-
     # 3) Query Description
-    truncated = answer_json.get("truncated", False)
-    desc = answer_json.get("query_description")
-    if truncated:
-        desc += f"\n\n*Showing first {MAX_ROWS} rows; results truncated.*"
+    desc = answer_json.get("query_description") or ""
     if desc:
         sections.append(f"## Query Description\n\n{desc}\n")
+
+    # 4) Truncation / size info (all computed in ask_genie)
+    db_total_rows   = answer_json.get("db_total_rows", 0)
+    csv_rows        = answer_json.get("csv_rows", 0)
+    shown_rows      = answer_json.get("shown_rows", len(rows) if isinstance(rows, list) else 0)
+    teams_truncated = answer_json.get("teams_truncated", 0)
+    csv_truncated   = answer_json.get("csv_truncated", 0)
+
+    notice_parts = []
+    if db_total_rows and db_total_rows > shown_rows:
+        notice_parts.append(f"Showing first {shown_rows:,} of {db_total_rows:,} rows")
+        # if teams_truncated:
+        #     notice_parts.append(f"Teams view cut {teams_truncated:,}")
+        if csv_truncated:
+            notice_parts.append(f"CSV contains the first 5,000 rows of {db_total_rows:,} ({csv_truncated:,} rows are truncated)")
+    truncation_notice = "_" + " • ".join(notice_parts) + "._" if notice_parts else ""
 
     if rows and schema:
         # build header
@@ -475,7 +582,11 @@ def process_query_results(answer_json: Dict) -> str:
                     out.append(str(val))
             table.append("| " + " | ".join(out) + " |")
 
-        sections.append("## Query Results\n\n" + "\n".join(table) + "\n")
+        results_block = "## Query Results\n\n"
+        if truncation_notice:
+            results_block += truncation_notice + "\n\n"
+        results_block += "\n".join(table) + "\n"
+        sections.append(results_block)
     else:
         logger.debug("No results table to render")
 
