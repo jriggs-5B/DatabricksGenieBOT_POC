@@ -29,6 +29,12 @@ from databricks.sdk.service.dashboards import GenieAPI, MessageStatus
 import asyncio
 import requests
 import re
+# from email.message import EmailMessage
+# from email.utils import formatdate
+import html
+# RE-ENABLE FOR EMAIL GRAPH SOLUTION
+import base64
+from urllib.parse import urlencode, quote
 
 # Log for prod
 # logging.basicConfig(level=logging.INFO)
@@ -68,6 +74,19 @@ BOT_URL = os.environ["BOT_URL"]
 DATABRICKS_WAREHOUSE_ID = os.getenv("SQL_WAREHOUSE_ID")
 DATABRICKS_CATALOG = os.getenv("DATABRICKS_CATALOG")
 DATABRICKS_SCHEMA  = os.getenv("DATABRICKS_SCHEMA")
+# RE-ENABLE FOR EMAIL GRAPH SOLUTION
+MS_CLIENT_ID     = os.getenv("MicrosoftAppId", "")
+MS_CLIENT_SECRET = os.getenv("MicrosoftAppPassword", "")
+MS_TENANT_ID     = os.getenv("MS_TENANT_ID")  # or your tenant GUID
+MS_REDIRECT_URI  = os.getenv("MS_REDIRECT_URI")         # e.g. https://<bot-host>/graph/callback
+MS_SCOPES        = "openid profile offline_access Mail.ReadWrite"
+GRAPH_TOKENS: Dict[str, Dict[str, str]] = {}
+# OWA_MAX_URL_LEN = 1400  # keep the final URL comfortably below Safe Links limits
+
+logger.info(
+    "Graph config at startup: client_id=%r tenant=%r redirect=%r",
+    MS_CLIENT_ID, MS_TENANT_ID, MS_REDIRECT_URI
+)
 
 workspace_client = WorkspaceClient(
     host=DATABRICKS_HOST,
@@ -466,11 +485,318 @@ async def ask_genie(
         logger.error(f"Error in ask_genie: {e}", exc_info=True)
         return json.dumps({"error": "An error occurred while processing your request."}), conversation_id
 
+def build_email_subject(answer_json: Dict) -> str:
+    """
+    Subject: Five Below - <first line of description (max 60 chars)>
+    """
+    desc = (answer_json.get("query_description") or "Results Summary").splitlines()[0].strip()
+    if len(desc) > 60:
+        desc = desc[:60].rstrip() + "…"
+    return f"Five Below - {desc}"
+
+def build_email_bodies(answer_json: Dict) -> tuple[str, str]:
+    """
+    Builds plaintext and HTML bodies.
+    - Top padding so users can type notes
+    - Header: 'Results Summary' (no 'Databricks')
+    - No SQL included
+    """
+    esc = html.escape
+
+    desc         = answer_json.get("query_description") or "Results Summary"
+    db_total     = int(answer_json.get("db_total_rows", 0) or 0)
+    csv_rows     = int(answer_json.get("csv_rows", 0) or 0)
+    shown        = int(answer_json.get("shown_rows", 0) or 0)
+    teams_cut    = max(csv_rows - shown, 0)
+    csv_cut      = max(db_total - csv_rows, 0)
+
+    # Small preview from the rows you already include in Teams (no SQL)
+    stmt     = answer_json.get("statement_response", {}) or {}
+    result   = (stmt.get("result") or {})
+    rows     = (result.get("data_array") or [])
+    manifest = (stmt.get("manifest") or {})
+    schema   = ((manifest.get("schema") or {}).get("columns") or [])
+    preview_rows = rows[:50] if isinstance(rows, list) else []
+    preview_cols = [c.get("name", f"Col{i}") for i, c in enumerate(schema)]
+
+    # --- Plaintext (with a few blank lines on top) ---
+    lines = []
+    lines.append("")  # 1st blank line for user typing
+    lines.append("")  # 2nd blank line
+    lines.append("")  # 3rd blank line
+    lines.append("(Type your notes above)")
+    lines.append("")  # extra space before header
+
+    lines.append("Results Summary")
+    lines.append("")
+    lines.append(f"Description: {desc}")
+    lines.append(f"Total rows in dataset: {db_total:,}")
+    lines.append(f"Rows in attached CSV: {csv_rows:,}")
+    lines.append(f"Rows shown in Teams: {shown:,}")
+    if teams_cut:
+        lines.append(f"Teams view truncated: {teams_cut:,}")
+    if csv_cut:
+        lines.append(f"CSV capped by Genie: {csv_cut:,}")
+    lines.append("")
+    if preview_rows and preview_cols:
+        lines.append("Preview (first 50 rows):")
+        lines.append(" | ".join(preview_cols))
+        lines.append("-" * 60)
+        for r in preview_rows:
+            safe = [("NULL" if v is None else str(v)) for v in r]
+            lines.append(" | ".join(safe))
+        lines.append("")
+    lines.append("Notes:")
+    lines.append("- CSV is attached.")
+    lines.append("- The preview above is truncated for readability.")
+    text_body = "\n".join(lines)
+
+    # --- HTML (with top padding for typing) ---
+    def fmt(v):
+        if isinstance(v, (int, float)):
+            return f"{v:,}"
+        return esc(str(v)) if v is not None else "NULL"
+
+    table_html = ""
+    if preview_rows and preview_cols:
+        thead = "".join(
+            f"<th style='border:1px solid #ddd;padding:6px;background:#f5f5f5;text-align:left'>{esc(c)}</th>"
+            for c in preview_cols
+        )
+        trs = []
+        for r in preview_rows:
+            tds = "".join(f"<td style='border:1px solid #ddd;padding:6px'>{fmt(v)}</td>" for v in r)
+            trs.append(f"<tr>{tds}</tr>")
+        tbody = "".join(trs)
+        table_html = f"""
+        <table cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #ddd;margin-top:8px">
+          <thead><tr>{thead}</tr></thead>
+          <tbody>{tbody}</tbody>
+        </table>
+        """
+
+    trunc_html_bits = []
+    if teams_cut:
+        trunc_html_bits.append(f"<li>Teams view truncated: <strong>{teams_cut:,}</strong></li>")
+    if csv_cut:
+        trunc_html_bits.append(f"<li>CSV capped by Genie: <strong>{csv_cut:,}</strong></li>")
+    trunc_html = f"<ul>{''.join(trunc_html_bits)}</ul>" if trunc_html_bits else ""
+
+    summary_html = f"""
+        <html>
+        <body style="font-family:Segoe UI, Arial, sans-serif; color:#222; font-size:14px;">
+            <!-- top padding for user to type -->
+            <p style="margin:0 0 12px 0;">&nbsp;</p>
+            <p style="margin:0 0 12px 0;">&nbsp;</p>
+            <p style="margin:0 0 12px 0;">&nbsp;</p>
+            <div style="min-height:3em;"></div>
+
+            <!-- Grey italic hint that disappears when typing -->
+            <div contenteditable="false" style="color:#888;font-style:italic;">
+            (Type your notes above)
+            </div>
+
+            <h2 style="margin:0 0 12px 0;">Results Summary</h2>
+            <p style="margin:0 0 8px 0;"><strong>Description:</strong> {esc(desc)}</p>
+            <p style="margin:0 0 6px 0;"><strong>Total rows in dataset:</strong> {db_total:,}</p>
+            <p style="margin:0 0 6px 0;"><strong>Rows in attached CSV:</strong> {csv_rows:,}</p>
+            <p style="margin:0 0 6px 0;"><strong>Rows shown in Teams:</strong> {shown:,}</p>
+            {trunc_html}
+            {"<h3 style='margin:16px 0 6px 0;'>Preview (first 50 rows)</h3>" if table_html else ""}
+            {table_html}
+            <p style="margin:16px 0 0 0; font-size:12px; color:#666;">
+            CSV is attached. The preview above is truncated for readability.
+            </p>
+        </body>
+        </html>
+        """.strip()
+
+    return text_body, summary_html
+
+# RE-ENABLE FOR EMAIL GRAPH SOLUTION
+def _oauth_authorize_url(state: str) -> str:
+    params = {
+        "client_id": MS_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": MS_REDIRECT_URI,
+        "response_mode": "query",
+        "scope": MS_SCOPES,
+        "state": state
+        # "prompt": "consent"
+    }
+    return f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/authorize?{urlencode(params)}"
+
+def _oauth_token_request(data: Dict[str, str]) -> Dict:
+    url = f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    r = requests.post(url, headers=headers, data=data, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def _now_epoch() -> int:
+    return int(time.time())
+
+def _save_tokens_for_user(user_id: str, tok: Dict):
+    GRAPH_TOKENS[user_id] = {
+        "access_token": tok["access_token"],
+        "refresh_token": tok.get("refresh_token", ""),
+        "expires_at": str(_now_epoch() + int(tok.get("expires_in", 3600) - 60)),
+    }
+
+def _get_valid_access_token(user_id: str) -> Optional[str]:
+    info = GRAPH_TOKENS.get(user_id)
+    if not info:
+        return None
+    if _now_epoch() < int(info.get("expires_at", "0")) and info.get("access_token"):
+        return info["access_token"]
+    if info.get("refresh_token"):
+        try:
+            tok = _oauth_token_request({
+                "client_id": MS_CLIENT_ID,
+                "scope": MS_SCOPES,
+                "refresh_token": info["refresh_token"],
+                "grant_type": "refresh_token",
+                "client_secret": MS_CLIENT_SECRET,
+                "redirect_uri": MS_REDIRECT_URI,
+            })
+            _save_tokens_for_user(user_id, tok)
+            return tok["access_token"]
+        except Exception:
+            logger.exception("Graph token refresh failed")
+    return None
+
+def create_draft_via_graph(access_token: str, subject: str, html_body: str) -> Dict:
+    url = "https://graph.microsoft.com/v1.0/me/messages"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    payload = {
+        "subject": subject,
+        "body": { "contentType": "HTML", "content": html_body },
+        "toRecipients": [], "ccRecipients": [], "bccRecipients": []
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def attach_csv_via_graph(access_token: str, message_id: str, csv_bytes: bytes, filename: str = "results.csv") -> Dict:
+    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/attachments"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    payload = {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": filename,
+        "contentType": "text/csv",
+        "contentBytes": base64.b64encode(csv_bytes).decode()
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+
+# def build_owa_compose_url(answer_json: Dict, conversation_id: str) -> str:
+#     """
+#     Outlook on the Web compose deeplink with compact HTML body:
+#     - inner HTML only (no <html><body> wrapper)
+#     - bodyIsHtml=true AND contentType=html
+#     - tiny preview table (<=5 rows, <=6 cols)
+#     """
+#     subject = build_email_subject(answer_json)  # "Five Below - <short desc>"
+
+#     # ---------- Build a compact inner HTML body ----------
+#     desc         = (answer_json.get("query_description") or "Results Summary")
+#     db_total     = int(answer_json.get("db_total_rows", 0) or 0)
+#     csv_rows     = int(answer_json.get("csv_rows", 0) or 0)
+#     shown        = int(answer_json.get("shown_rows", 0) or 0)
+#     teams_cut    = max(csv_rows - shown, 0)
+#     csv_cut      = max(db_total - csv_rows, 0)
+
+#     # tiny preview table (<=5 rows, <=6 cols)
+#     stmt     = answer_json.get("statement_response", {}) or {}
+#     result   = (stmt.get("result") or {})
+#     rows     = (result.get("data_array") or [])
+#     manifest = (stmt.get("manifest") or {})
+#     schema   = ((manifest.get("schema") or {}).get("columns") or [])
+
+#     max_cols = 6
+#     max_rows = 5
+#     cols     = [c.get("name", f"Col{i}") for i, c in enumerate(schema[:max_cols])]
+#     tiny_rows = []
+#     for r in rows[:max_rows]:
+#         tiny_rows.append([ "NULL" if v is None else str(v) for v in r[:max_cols] ])
+
+#     def html_table(cols, data):
+#         if not cols or not data:
+#             return ""
+#         thead = "".join(f'<th style="border:1px solid #ddd;padding:6px;background:#f5f5f5;text-align:left">{quote(str(c))}</th>' for c in cols)
+#         body_rows = []
+#         for rr in data:
+#             tds = "".join(f'<td style="border:1px solid #ddd;padding:6px">{quote(str(v))}</td>' for v in rr)
+#             body_rows.append(f"<tr>{tds}</tr>")
+#         return (
+#             '<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #ddd;margin-top:8px">'
+#             f"<thead><tr>{thead}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+#         )
+
+#     csv_link = f"{BOT_URL}/download_csv?session={conversation_id}"
+#     trunc_bits = []
+#     if teams_cut:
+#         trunc_bits.append(f"Teams view truncated: <strong>{teams_cut:,}</strong>")
+#     if csv_cut:
+#         trunc_bits.append(f"CSV capped by Genie: <strong>{csv_cut:,}</strong>")
+#     trunc_html = ""
+#     if trunc_bits:
+#         trunc_html = "<ul>" + "".join(f"<li>{b}</li>" for b in trunc_bits) + "</ul>"
+
+#     inner_html = (
+#         # top padding for notes
+#         '<p style="margin:0 0 12px 0;">&nbsp;</p>'
+#         '<p style="margin:0 0 12px 0;">&nbsp;</p>'
+#         '<p style="margin:0 0 12px 0;">&nbsp;</p>'
+#         '<h2 style="margin:0 0 12px 0;">Results Summary</h2>'
+#         f'<p style="margin:0 0 10px 0"><a href="{csv_link}">Download CSV</a></p>'
+#         f"<p><strong>Description:</strong> {desc}</p>"
+#         f"<p><strong>Total rows in dataset:</strong> {db_total:,}</p>"
+#         f"<p><strong>Rows shown in Teams:</strong> {shown:,} &nbsp; <strong>Rows in CSV:</strong> {csv_rows:,}</p>"
+#         f"{trunc_html}"
+#         f"{html_table(cols, tiny_rows)}"
+#     )
+
+#     # Remove any accidental whitespace between tags to shorten URL
+#     inner_html = re.sub(r">\s+<", "><", inner_html).strip()
+
+#     base = "https://outlook.office.com/owa/?path=/mail/action/compose"
+
+#     def make_url(body_html: str, subj: str) -> str:
+#         # Encode everything so spaces -> %20 and HTML is preserved
+#         qs = (
+#             f"subject={quote(subj, safe='')}"
+#             f"&body={quote(body_html, safe='')}"
+#             f"&bodyIsHtml=true&contentType=html"
+#         )
+#         return f"{base}&{qs}"
+
+#     url = make_url(inner_html, subject)
+
+#     # If somehow still long, drop the table and try again
+#     if len(url) > OWA_MAX_URL_LEN:
+#         minimal = re.sub(r"<table[\s\S]*?</table>", "", inner_html, flags=re.IGNORECASE)
+#         url = make_url(minimal, subject)
+
+#     # Final fallback: header + CSV link only
+#     if len(url) > OWA_MAX_URL_LEN:
+#         tiny = (
+#             '<h2 style="margin:0 0 12px 0;">Results Summary</h2>'
+#             f'<p style="margin:0 0 10px 0"><a href="{csv_link}">Download CSV</a></p>'
+#         )
+#         url = make_url(tiny, subject)
+
+#     return url
 
 def build_sql_toggle_card(
     raw_sql: str,
     conversation_id: str,
-    truncated: bool
+    truncated: bool,
+    # RE-ENABLE FOR EMAIL GRAPH SOLUTION
+    user_id: str
 ) -> Attachment:
     # 1) base card
     card = {
@@ -500,6 +826,15 @@ def build_sql_toggle_card(
             "type":  "Action.OpenUrl",
             "title": "Show Chart",
             "url":   f"{DASH_URL}/chart?session={conversation_id}"
+        },
+        {
+            # RE-ENABLE FOR EMAIL GRAPH SOLUTION
+            "type": "Action.OpenUrl",
+            "title": "Summarize & Draft Email",
+            "url": f"{BOT_URL}/graph/login?session={conversation_id}&user={user_id}"
+            # "type": "Action.OpenUrl",
+            # "title": "Summarize & Draft Email",
+            # "url": build_owa_compose_url(SESSION_DATA.get(conversation_id, {}), conversation_id)
         }
       ]
     }
@@ -656,7 +991,9 @@ class MyBot(ActivityHandler):
             conversation  = self.conversation_ids[user_id]
             truncated     = answer_json.get("truncated", False)
 
-            sql_card = build_sql_toggle_card(raw_sql, conversation, truncated)
+            # RE-ENABLE FOR EMAIL GRAPH SOLUTION
+            sql_card = build_sql_toggle_card(raw_sql, conversation, truncated, user_id)
+            # sql_card = build_sql_toggle_card(raw_sql, conversation, truncated)
             await turn_context.send_activity(
                 MessageFactory.attachment(sql_card)
             )
@@ -746,3 +1083,125 @@ if __name__ == "__main__":
         web.run_app(app, host=host, port=port)
     except Exception as error:
         logger.exception("Error running app")
+
+# # Compose .eml draft with HTML + plaintext body and CSV attachment
+# async def compose_eml(request: web.Request) -> web.Response:
+#     session = request.query.get("session")
+#     csv_path = SESSION_FILES.get(session)
+#     data     = SESSION_DATA.get(session)
+
+#     if not data:
+#         return web.Response(status=404, text="No session data to summarize.")
+#     if not csv_path or not os.path.exists(csv_path):
+#         return web.Response(status=404, text="No CSV available for this session.")
+
+#     # Build bodies and subject
+#     text_body, html_body = build_email_bodies(data)
+#     subject = build_email_subject(data)
+
+#     # Create the email draft (compose mode)
+#     msg = EmailMessage()
+#     msg["Subject"] = subject
+#     msg["X-Unsent"] = "1"  # critical: open as draft in Outlook
+#     # Leave From/To/Date unset so Outlook treats it as a new draft
+
+#     # Bodies: plaintext then HTML (Outlook prefers HTML)
+#     msg.set_content(text_body)
+#     msg.add_alternative(html_body, subtype="html")
+
+#     # Attach CSV
+#     try:
+#         with open(csv_path, "rb") as f:
+#             csv_bytes = f.read()
+#         msg.add_attachment(
+#             csv_bytes,
+#             maintype="text",
+#             subtype="csv",
+#             filename=os.path.basename(csv_path),
+#         )
+#     except Exception:
+#         logger.exception("Failed attaching CSV to EML")
+#         return web.Response(status=500, text="Failed to attach CSV.")
+
+#     # Serialize to .eml and return as a download
+#     tf = tempfile.NamedTemporaryFile(delete=False, suffix=".eml", dir="/tmp")
+#     with open(tf.name, "wb") as emlfile:
+#         emlfile.write(bytes(msg))
+
+#     return web.FileResponse(
+#         tf.name,
+#         headers={"Content-Disposition": 'attachment; filename="results-draft.eml"'}
+#     )
+
+# # Route
+# app.router.add_get("/compose_eml", compose_eml)
+
+# RE-ENABLE FOR EMAIL GRAPH SOLUTION
+# # Kick off login; carry session + user in state
+async def graph_login(request: web.Request) -> web.Response:
+    session = request.query.get("session") or ""
+    user_id = request.query.get("user") or ""
+    if not session or not user_id:
+        return web.Response(status=400, text="Missing session or user.")
+    state = json.dumps({"session": session, "user": user_id})
+    return web.HTTPFound(_oauth_authorize_url(state))
+
+app.router.add_get("/graph/login", graph_login)
+
+# # OAuth callback: exchange code, create draft, attach CSV, show link
+async def graph_callback(request: web.Request) -> web.Response:
+    code  = request.query.get("code")
+    state = request.query.get("state")
+    if not code or not state:
+        return web.Response(status=400, text="Missing code or state.")
+    try:
+        s = json.loads(state); session = s["session"]; user_id = s["user"]
+    except Exception:
+        return web.Response(status=400, text="Invalid state")
+
+    try:
+        tok = _oauth_token_request({
+            "client_id": MS_CLIENT_ID,
+            "scope": MS_SCOPES,
+            "code": code,
+            "grant_type": "authorization_code",
+            "client_secret": MS_CLIENT_SECRET,
+            "redirect_uri": MS_REDIRECT_URI,
+        })
+        _save_tokens_for_user(user_id, tok)
+        access_token = tok["access_token"]
+    except Exception:
+        logger.exception("Token exchange failed")
+        return web.Response(status=500, text="Failed to sign in to Microsoft Graph.")
+
+    csv_path = SESSION_FILES.get(session)
+    data     = SESSION_DATA.get(session)
+    if not data:
+        return web.Response(status=404, text="No session data to summarize.")
+    if not csv_path or not os.path.exists(csv_path):
+        return web.Response(status=404, text="No CSV available for this session.")
+
+    text_body, html_body = build_email_bodies(data)
+    subject = build_email_subject(data)
+
+    try:
+        draft = create_draft_via_graph(access_token, subject, html_body)
+        msg_id  = draft.get("id")
+        web_link= draft.get("webLink")
+        with open(csv_path, "rb") as f:
+            csv_bytes = f.read()
+        _ = attach_csv_via_graph(access_token, msg_id, csv_bytes, os.path.basename(csv_path))
+    except Exception:
+        logger.exception("Failed to create draft or attach CSV via Graph")
+        return web.Response(status=500, text="Failed to create Outlook draft.")
+
+    return web.Response(
+        text=f"""<html><body style="font-family:Segoe UI, Arial">
+                 <h3>Draft created</h3>
+                 <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
+                 <p>You can also find it in your Drafts folder in desktop Outlook.</p>
+                 </body></html>""",
+        content_type="text/html"
+    )
+
+app.router.add_get("/graph/callback", graph_callback)
