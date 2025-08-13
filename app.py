@@ -35,6 +35,8 @@ import html
 # RE-ENABLE FOR EMAIL GRAPH SOLUTION
 import base64
 from urllib.parse import urlencode, quote
+from contextlib import suppress
+import sqlparse
 
 # Log for prod
 # logging.basicConfig(level=logging.INFO)
@@ -82,6 +84,69 @@ MS_REDIRECT_URI  = os.getenv("MS_REDIRECT_URI")         # e.g. https://<bot-host
 MS_SCOPES        = "openid profile offline_access Mail.ReadWrite"
 GRAPH_TOKENS: Dict[str, Dict[str, str]] = {}
 # OWA_MAX_URL_LEN = 1400  # keep the final URL comfortably below Safe Links limits
+PREVIEW_MAX_ROWS = 50
+TYPING_INTERVAL = 4.0
+DRAFT_CACHE_TTL = 120  # seconds to treat a draft as 'recent'
+DRAFTS_BY_KEY: dict[str, dict] = {}
+
+# ---- Genie per-turn instructions (applied on every message) -----------------
+# Toggle with GENIE_INSTRUCTIONS_ENABLED=1 to enable; leave unset/0 to disable.
+GENIE_INSTRUCTIONS_ENABLED = os.getenv("GENIE_INSTRUCTIONS_ENABLED", "1") == "1"
+
+GENIE_INSTRUCTIONS = """\
+INSTRUCTIONS (SQL Authoring Rules)
+- Always use ILIKE (never LIKE).
+- Never use SELECT *.
+- For counts, use DISTINCT counts unless explicitly told otherwise.
+- Never show more than 20 columns in the result.
+- Fiscal year starts in February.
+
+Business Semantics & Definitions
+- "Order" = purchase order.
+- Order due date to DC = PO_ANTICIPATE_DT.
+- Cargo ready delay when Target_Cargo_Ready_DT < Latest_Vendor_Cargo_Ready_DT;
+  delay = Latest_Vendor_Cargo_Ready_DT - Target_Cargo_Ready_DT.
+- Delay to ship center/DC compares PO_ANTICIPATE_DT to SUGGESTED_NEW_ANTICIPATE_DT;
+  delay = SUGGESTED_NEW_ANTICIPATE_DT - PO_ANTICIPATE_DT and must be non-negative.
+- Domestic orders: FOB_TYPE_CD IN ('DOMESTIC PREPAID','DOMESTIC COLLECT').
+- Import orders: FOB_TYPE_CD = 'IMPORT'.
+- Bookings are due when booked_dt IS NULL and current_date > REQUEST_DT + 21 days.
+- Orders are past due to ship if REQUEST_DT > current_date.
+- Import orders departed late if Actual departed date > (PO ship date + 7 days).
+- Container is unassigned if container_no IS NULL or blank.
+- Set is determined by PRIORITY_CD.
+- Container on-time if max(SUGGESTED_NEW_ANTICIPATE_DT) < min(PO_ANTICIPATE_DT); otherwise late.
+
+Column/Term Mappings
+- Ocean lane = Port of origin → Port of discharge.
+- DC = LOCATION_NO in inbound_po_supply_chain_20250721.
+- DC = DELIVERY_ADDRESS_TXT in inbound_otw_report_20250721.
+- Port of Discharge / Discharge Port = FIRST_DISCHARGE_NAME.
+
+Counting Rules
+- When counting containers, always COUNT(DISTINCT container_no).
+
+FEU / TEU Logic
+- FEU = forty-foot equivalent unit.
+- If booked_date IS NULL:   FEU = Ordered_Line_Volume / 61
+  Else:                      FEU = Booked_Line_Volume / 61
+
+Data Quality
+- Delay Reason code must NOT be blank if ETD is after PO ship date.
+
+Lead Time & OTIF
+- Average lead time = ACTUAL_DC_ARRIVAL_DT - ORDER_DT.
+- OTIF = On-Time and In Full; an order is OTIF when received in full AND on time.
+- On time if ACTUAL_DC_ARRIVAL_DT <= PO_ANTICIPATE_DT.
+- In full if ORDERED_QTY <= RECEIVED_QTY.
+
+Dataset Routing
+- Containers/FEU/TEU/shipments → inbound_otw_report_20250721.
+- Orders → inbound_po_supply_chain_20250721.
+- Receipts / received orders → inbound_otw_report_20250721.
+
+Apply all rules above when interpreting the request and generating SQL.
+"""
 
 logger.info(
     "Graph config at startup: client_id=%r tenant=%r redirect=%r",
@@ -177,6 +242,16 @@ def get_attachment_query_result(space_id, conversation_id, message_id, attachmen
         logger.error(f"Failed to process Genie API response: {e}, text: {response.text}")
         return {}
 
+
+# Per-key async locks to avoid race conditions when two hits arrive at once
+_DRAFT_LOCKS: dict[str, asyncio.Lock] = {}
+def _get_draft_lock(key: str) -> asyncio.Lock:
+    lock = _DRAFT_LOCKS.get(key)
+    if not lock:
+        lock = asyncio.Lock()
+        _DRAFT_LOCKS[key] = lock
+    return lock
+
 def execute_attachment_query(space_id, conversation_id, message_id, attachment_id, payload):
     url = f"{DATABRICKS_HOST}/genie/spaces/{space_id}/conversations/{conversation_id}/messages/{message_id}/attachments/{attachment_id}/execute-query"
     headers = {
@@ -255,6 +330,12 @@ def count_total_rows_via_sql_warehouse(raw_sql: str) -> Optional[int]:
 #     sql = raw_sql.strip().rstrip(";")
 #     return f"SELECT COUNT(*) AS total_count FROM (\n{sql}\n) AS t"
 
+def _compose_genie_prompt(user_question: str) -> str:
+    if not GENIE_INSTRUCTIONS_ENABLED:
+        return user_question
+    # Keep it simple and deterministic (no markdown blocks needed).
+    return f"{GENIE_INSTRUCTIONS}\nREQUEST:\n{user_question}"
+
 logger = logging.getLogger(__name__)
 
 async def ask_genie(
@@ -270,16 +351,31 @@ async def ask_genie(
         # ───────────────────────────────────────────────────────────────────────────
         # 1) start or continue conversation
         # ───────────────────────────────────────────────────────────────────────────
+        # if conversation_id is None:
+        #     initial_message = await loop.run_in_executor(
+        #         None, genie_api.start_conversation_and_wait, space_id, question
+        #     )
+        #     conversation_id = initial_message.conversation_id
+        # else:
+        #     initial_message = await loop.run_in_executor(
+        #         None,
+        #         genie_api.create_message_and_wait,
+        #         space_id, conversation_id, question
+        #     )
+
+        # Compose prompt with per-turn instructions
+        composed_question = _compose_genie_prompt(question)
+
         if conversation_id is None:
             initial_message = await loop.run_in_executor(
-                None, genie_api.start_conversation_and_wait, space_id, question
+                None, genie_api.start_conversation_and_wait, space_id, composed_question
             )
             conversation_id = initial_message.conversation_id
         else:
             initial_message = await loop.run_in_executor(
                 None,
                 genie_api.create_message_and_wait,
-                space_id, conversation_id, question
+                space_id, conversation_id, composed_question
             )
 
         message_id = initial_message.message_id
@@ -485,133 +581,261 @@ async def ask_genie(
         logger.error(f"Error in ask_genie: {e}", exc_info=True)
         return json.dumps({"error": "An error occurred while processing your request."}), conversation_id
 
-def build_email_subject(answer_json: Dict) -> str:
-    """
-    Subject: Five Below - <first line of description (max 60 chars)>
-    """
-    desc = (answer_json.get("query_description") or "Results Summary").splitlines()[0].strip()
-    if len(desc) > 60:
-        desc = desc[:60].rstrip() + "…"
-    return f"Five Below - {desc}"
+SUBJECT_PREFIX = "Five Below - "
+SUBJECT_MAX = 72  # keep it inbox-friendly
 
-def build_email_bodies(answer_json: Dict) -> tuple[str, str]:
-    """
-    Builds plaintext and HTML bodies.
-    - Top padding so users can type notes
-    - Header: 'Results Summary' (no 'Databricks')
-    - No SQL included
-    """
-    esc = html.escape
+def build_business_subject(answer_json: Dict) -> str:
+    desc = (answer_json.get("query_description") or "").strip()
+    if not desc:
+        return SUBJECT_PREFIX + "Results Summary"
 
-    desc         = answer_json.get("query_description") or "Results Summary"
-    db_total     = int(answer_json.get("db_total_rows", 0) or 0)
-    csv_rows     = int(answer_json.get("csv_rows", 0) or 0)
-    shown        = int(answer_json.get("shown_rows", 0) or 0)
-    teams_cut    = max(csv_rows - shown, 0)
-    csv_cut      = max(db_total - csv_rows, 0)
+    # trim boilerplate words
+    desc = re.sub(r"\b(this|a|an|the|of|for|to|that|which)\b", "", desc, flags=re.I)
+    desc = re.sub(r"\s+", " ", desc).strip(" -—:.,")
+    # kill quotes/brackets that clutter subjects
+    desc = desc.replace('"', '').replace("'", "").replace("[", "").replace("]", "")
+    subj = SUBJECT_PREFIX + desc
 
-    # Small preview from the rows you already include in Teams (no SQL)
+    # nicely truncate on word boundary
+    if len(subj) > SUBJECT_MAX:
+        cut = subj[:SUBJECT_MAX].rsplit(" ", 1)[0]
+        subj = cut + "…"
+    return subj
+
+# def build_email_subject(answer_json: Dict) -> str:
+#     """
+#     Subject: Five Below - <first line of description (max 60 chars)>
+#     """
+#     desc = (answer_json.get("query_description") or "Results Summary").splitlines()[0].strip()
+#     if len(desc) > 60:
+#         desc = desc[:60].rstrip() + "…"
+#     return f"Five Below - {desc}"
+
+# def build_email_bodies(answer_json: Dict) -> tuple[str, str]:
+#     """
+#     Builds plaintext and HTML bodies.
+#     - Top padding so users can type notes
+#     - Header: 'Results Summary' (no 'Databricks')
+#     - No SQL included
+#     """
+#     esc = html.escape
+
+#     desc         = answer_json.get("query_description") or "Results Summary"
+#     db_total     = int(answer_json.get("db_total_rows", 0) or 0)
+#     csv_rows     = int(answer_json.get("csv_rows", 0) or 0)
+#     shown        = int(answer_json.get("shown_rows", 0) or 0)
+#     teams_cut    = max(csv_rows - shown, 0)
+#     csv_cut      = max(db_total - csv_rows, 0)
+
+#     # Small preview from the rows you already include in Teams (no SQL)
+#     stmt     = answer_json.get("statement_response", {}) or {}
+#     result   = (stmt.get("result") or {})
+#     rows     = (result.get("data_array") or [])
+#     manifest = (stmt.get("manifest") or {})
+#     schema   = ((manifest.get("schema") or {}).get("columns") or [])
+#     preview_rows = rows[:50] if isinstance(rows, list) else []
+#     preview_cols = [c.get("name", f"Col{i}") for i, c in enumerate(schema)]
+
+#     # --- Plaintext (with a few blank lines on top) ---
+#     lines = []
+#     lines.append("")  # 1st blank line for user typing
+#     lines.append("")  # 2nd blank line
+#     lines.append("")  # 3rd blank line
+#     lines.append("(Type your notes above)")
+#     lines.append("")  # extra space before header
+
+#     lines.append("Results Summary")
+#     lines.append("")
+#     lines.append(f"Description: {desc}")
+#     lines.append(f"Total rows in dataset: {db_total:,}")
+#     lines.append(f"Rows in attached CSV: {csv_rows:,}")
+#     lines.append(f"Rows shown in Teams: {shown:,}")
+#     if teams_cut:
+#         lines.append(f"Teams view truncated: {teams_cut:,}")
+#     if csv_cut:
+#         lines.append(f"CSV capped by Genie: {csv_cut:,}")
+#     lines.append("")
+#     if preview_rows and preview_cols:
+#         lines.append("Preview (first 50 rows):")
+#         lines.append(" | ".join(preview_cols))
+#         lines.append("-" * 60)
+#         for r in preview_rows:
+#             safe = [("NULL" if v is None else str(v)) for v in r]
+#             lines.append(" | ".join(safe))
+#         lines.append("")
+#     lines.append("Notes:")
+#     lines.append("- CSV is attached.")
+#     lines.append("- The preview above is truncated for readability.")
+#     text_body = "\n".join(lines)
+
+#     # --- HTML (with top padding for typing) ---
+#     def fmt(v):
+#         if isinstance(v, (int, float)):
+#             return f"{v:,}"
+#         return esc(str(v)) if v is not None else "NULL"
+
+#     table_html = ""
+#     if preview_rows and preview_cols:
+#         thead = "".join(
+#             f"<th style='border:1px solid #ddd;padding:6px;background:#f5f5f5;text-align:left'>{esc(c)}</th>"
+#             for c in preview_cols
+#         )
+#         trs = []
+#         for r in preview_rows:
+#             tds = "".join(f"<td style='border:1px solid #ddd;padding:6px'>{fmt(v)}</td>" for v in r)
+#             trs.append(f"<tr>{tds}</tr>")
+#         tbody = "".join(trs)
+#         table_html = f"""
+#         <table cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #ddd;margin-top:8px">
+#           <thead><tr>{thead}</tr></thead>
+#           <tbody>{tbody}</tbody>
+#         </table>
+#         """
+
+#     trunc_html_bits = []
+#     if teams_cut:
+#         trunc_html_bits.append(f"<li>Teams view truncated: <strong>{teams_cut:,}</strong></li>")
+#     if csv_cut:
+#         trunc_html_bits.append(f"<li>CSV capped by Genie: <strong>{csv_cut:,}</strong></li>")
+#     trunc_html = f"<ul>{''.join(trunc_html_bits)}</ul>" if trunc_html_bits else ""
+
+#     summary_html = f"""
+#         <html>
+#         <body style="font-family:Segoe UI, Arial, sans-serif; color:#222; font-size:14px;">
+#             <!-- top padding for user to type -->
+#             <p style="margin:0 0 12px 0;">&nbsp;</p>
+#             <p style="margin:0 0 12px 0;">&nbsp;</p>
+#             <p style="margin:0 0 12px 0;">&nbsp;</p>
+#             <div style="min-height:3em;"></div>
+
+#             <!-- Grey italic hint that disappears when typing -->
+#             <div contenteditable="false" style="color:#888;font-style:italic;">
+#             (Type your notes above)
+#             </div>
+
+#             <h2 style="margin:0 0 12px 0;">Results Summary</h2>
+#             <p style="margin:0 0 8px 0;"><strong>Description:</strong> {esc(desc)}</p>
+#             <p style="margin:0 0 6px 0;"><strong>Total rows in dataset:</strong> {db_total:,}</p>
+#             <p style="margin:0 0 6px 0;"><strong>Rows in attached CSV:</strong> {csv_rows:,}</p>
+#             <p style="margin:0 0 6px 0;"><strong>Rows shown in Teams:</strong> {shown:,}</p>
+#             {trunc_html}
+#             {"<h3 style='margin:16px 0 6px 0;'>Preview (first 50 rows)</h3>" if table_html else ""}
+#             {table_html}
+#             <p style="margin:16px 0 0 0; font-size:12px; color:#666;">
+#             CSV is attached. The preview above is truncated for readability.
+#             </p>
+#         </body>
+#         </html>
+#         """.strip()
+
+#     return text_body, summary_html
+
+def build_email_bodies(answer_json: Dict, preview_max: int = PREVIEW_MAX_ROWS) -> tuple[str, str, bool]:
+    """
+    Build both PLAINTEXT and HTML versions of the email body from the Genie `answer_json`.
+
+    Policy:
+      • If TOTAL rows ≤ preview_max (default 50): include a preview table (no CSV attachment).
+      • If TOTAL rows  > preview_max: omit preview table (CSV should be attached by caller).
+
+    Returns: (plain_body, html_body, included_preview)
+      - included_preview == True → NO attachment should be added by the caller
+      - included_preview == False → Caller should attach CSV
+    """
+    # Sizes computed earlier in ask_genie
+    db_total_rows   = int(answer_json.get("db_total_rows") or 0)
+    csv_rows        = int(answer_json.get("csv_rows") or 0)
+    shown_rows      = int(answer_json.get("shown_rows") or 0)
+    teams_truncated = int(answer_json.get("teams_truncated") or 0)
+    csv_truncated   = int(answer_json.get("csv_truncated") or 0)
+
+    desc     = (answer_json.get("query_description") or "Results Summary").strip()
     stmt     = answer_json.get("statement_response", {}) or {}
     result   = (stmt.get("result") or {})
     rows     = (result.get("data_array") or [])
     manifest = (stmt.get("manifest") or {})
     schema   = ((manifest.get("schema") or {}).get("columns") or [])
-    preview_rows = rows[:50] if isinstance(rows, list) else []
-    preview_cols = [c.get("name", f"Col{i}") for i, c in enumerate(schema)]
+    col_names: List[str] = [c.get("name", f"Col{i}") for i, c in enumerate(schema)]
 
-    # --- Plaintext (with a few blank lines on top) ---
+    include_preview = db_total_rows <= preview_max
+
+    # ----------------- PLAINTEXT -----------------
     lines = []
-    lines.append("")  # 1st blank line for user typing
-    lines.append("")  # 2nd blank line
-    lines.append("")  # 3rd blank line
-    lines.append("(Type your notes above)")
-    lines.append("")  # extra space before header
-
+    lines.append("")
+    lines.append("")
+    lines.append("")
     lines.append("Results Summary")
     lines.append("")
     lines.append(f"Description: {desc}")
-    lines.append(f"Total rows in dataset: {db_total:,}")
-    lines.append(f"Rows in attached CSV: {csv_rows:,}")
-    lines.append(f"Rows shown in Teams: {shown:,}")
-    if teams_cut:
-        lines.append(f"Teams view truncated: {teams_cut:,}")
-    if csv_cut:
-        lines.append(f"CSV capped by Genie: {csv_cut:,}")
-    lines.append("")
-    if preview_rows and preview_cols:
-        lines.append("Preview (first 50 rows):")
-        lines.append(" | ".join(preview_cols))
-        lines.append("-" * 60)
-        for r in preview_rows:
-            safe = [("NULL" if v is None else str(v)) for v in r]
-            lines.append(" | ".join(safe))
+    lines.append(f"Total rows in dataset: {db_total_rows:,}")
+    lines.append(f"Rows shown in Teams: {shown_rows:,}")
+    lines.append(f"Rows in CSV: {csv_rows:,}")
+    if teams_truncated:
+        lines.append(f"Teams view truncated: {teams_truncated:,}")
+    if csv_truncated:
+        lines.append(f"CSV capped by Genie: {csv_truncated:,}")
+    if include_preview:
         lines.append("")
-    lines.append("Notes:")
-    lines.append("- CSV is attached.")
-    lines.append("- The preview above is truncated for readability.")
-    text_body = "\n".join(lines)
+        lines.append(f"All rows are shown inline (≤ {preview_max}).")
+        # Optional: add a tiny plaintext preview header and first few lines
+        # (kept minimal since HTML carries the full 50-row preview)
+        header_txt = " | ".join(col_names)
+        lines.append("")
+        lines.append(header_txt)
+        lines.append("-" * len(header_txt))
+        for r in rows[:min(len(rows), preview_max, 5)]:
+            lines.append(" | ".join("NULL" if v is None else str(v) for v in r))
+    else:
+        lines.append("")
+        lines.append(f"Preview omitted due to size (> {preview_max} rows). CSV attached.")
 
-    # --- HTML (with top padding for typing) ---
-    def fmt(v):
-        if isinstance(v, (int, float)):
-            return f"{v:,}"
-        return esc(str(v)) if v is not None else "NULL"
+    plain_body = "\n".join(lines).strip("\n")
 
-    table_html = ""
-    if preview_rows and preview_cols:
+    # ------------------- HTML --------------------
+    def esc(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    html_parts = [
+        '<p style="margin:0 0 12px 0;">&nbsp;</p>',
+        '<p style="margin:0 0 12px 0;">&nbsp;</p>',
+        '<p style="margin:0 0 12px 0;">&nbsp;</p>',
+        '<h2 style="margin:0 0 12px 0;">Results Summary</h2>',
+        f"<p><strong>Description:</strong> {esc(desc)}</p>",
+        f"<p><strong>Total rows in dataset:</strong> {db_total_rows:,}</p>",
+        f"<p><strong>Rows shown in Teams:</strong> {shown_rows:,} &nbsp; <strong>Rows in CSV:</strong> {csv_rows:,}</p>",
+    ]
+    if teams_truncated or csv_truncated:
+        html_parts.append("<ul>")
+        if teams_truncated:
+            html_parts.append(f"<li>Teams view truncated: <strong>{teams_truncated:,}</strong></li>")
+        if csv_truncated:
+            html_parts.append(f"<li>CSV capped by Genie: <strong>{csv_truncated:,}</strong></li>")
+        html_parts.append("</ul>")
+
+    if include_preview and rows and col_names:
+        # Full preview table (all rows since total ≤ preview_max)
         thead = "".join(
-            f"<th style='border:1px solid #ddd;padding:6px;background:#f5f5f5;text-align:left'>{esc(c)}</th>"
-            for c in preview_cols
+            f'<th style="border:1px solid #ddd;padding:6px;background:#f5f5f5;text-align:left">{esc(c)}</th>'
+            for c in col_names
         )
-        trs = []
-        for r in preview_rows:
-            tds = "".join(f"<td style='border:1px solid #ddd;padding:6px'>{fmt(v)}</td>" for v in r)
-            trs.append(f"<tr>{tds}</tr>")
-        tbody = "".join(trs)
-        table_html = f"""
-        <table cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #ddd;margin-top:8px">
-          <thead><tr>{thead}</tr></thead>
-          <tbody>{tbody}</tbody>
-        </table>
-        """
+        body_rows = []
+        for r in rows[:preview_max]:
+            tds = "".join(
+                f'<td style="border:1px solid #ddd;padding:6px">{esc("NULL" if v is None else str(v))}</td>'
+                for v in r
+            )
+            body_rows.append(f"<tr>{tds}</tr>")
+        table_html = (
+            '<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #ddd;margin-top:8px">'
+            f"<thead><tr>{thead}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+        )
+        html_parts.append(table_html)
+    else:
+        html_parts.append(f'<p><em>Preview omitted due to size (&gt; {preview_max} rows). CSV attached.</em></p>')
 
-    trunc_html_bits = []
-    if teams_cut:
-        trunc_html_bits.append(f"<li>Teams view truncated: <strong>{teams_cut:,}</strong></li>")
-    if csv_cut:
-        trunc_html_bits.append(f"<li>CSV capped by Genie: <strong>{csv_cut:,}</strong></li>")
-    trunc_html = f"<ul>{''.join(trunc_html_bits)}</ul>" if trunc_html_bits else ""
+    html_body = "".join(html_parts)
 
-    summary_html = f"""
-        <html>
-        <body style="font-family:Segoe UI, Arial, sans-serif; color:#222; font-size:14px;">
-            <!-- top padding for user to type -->
-            <p style="margin:0 0 12px 0;">&nbsp;</p>
-            <p style="margin:0 0 12px 0;">&nbsp;</p>
-            <p style="margin:0 0 12px 0;">&nbsp;</p>
-            <div style="min-height:3em;"></div>
-
-            <!-- Grey italic hint that disappears when typing -->
-            <div contenteditable="false" style="color:#888;font-style:italic;">
-            (Type your notes above)
-            </div>
-
-            <h2 style="margin:0 0 12px 0;">Results Summary</h2>
-            <p style="margin:0 0 8px 0;"><strong>Description:</strong> {esc(desc)}</p>
-            <p style="margin:0 0 6px 0;"><strong>Total rows in dataset:</strong> {db_total:,}</p>
-            <p style="margin:0 0 6px 0;"><strong>Rows in attached CSV:</strong> {csv_rows:,}</p>
-            <p style="margin:0 0 6px 0;"><strong>Rows shown in Teams:</strong> {shown:,}</p>
-            {trunc_html}
-            {"<h3 style='margin:16px 0 6px 0;'>Preview (first 50 rows)</h3>" if table_html else ""}
-            {table_html}
-            <p style="margin:16px 0 0 0; font-size:12px; color:#666;">
-            CSV is attached. The preview above is truncated for readability.
-            </p>
-        </body>
-        </html>
-        """.strip()
-
-    return text_body, summary_html
+    return plain_body, html_body, include_preview
 
 # RE-ENABLE FOR EMAIL GRAPH SOLUTION
 def _oauth_authorize_url(state: str) -> str:
@@ -691,114 +915,117 @@ def attach_csv_via_graph(access_token: str, message_id: str, csv_bytes: bytes, f
     return r.json()
 
 
+def format_sql_for_card(raw_sql: str) -> str:
+    """
+    Prettify SQL for display (IDE-like). Falls back to raw on any error.
+    """
+    try:
+        return sqlparse.format(
+            raw_sql or "",
+            reindent=True,
+            keyword_case="upper",     # UPPER keywords
+            identifier_case=None,     # keep identifiers as-is
+            strip_comments=False,     # keep comments
+            use_space_around_operators=True
+        ).strip()
+    except Exception:
+        return raw_sql or ""
 
-# def build_owa_compose_url(answer_json: Dict, conversation_id: str) -> str:
-#     """
-#     Outlook on the Web compose deeplink with compact HTML body:
-#     - inner HTML only (no <html><body> wrapper)
-#     - bodyIsHtml=true AND contentType=html
-#     - tiny preview table (<=5 rows, <=6 cols)
-#     """
-#     subject = build_email_subject(answer_json)  # "Five Below - <short desc>"
+def escape_md_for_card(text: str) -> str:
+    """
+    Adaptive Card TextBlock parses a subset of Markdown. Escape chars that
+    often break SQL (underscore/pipe/asterisk/backtick).
+    """
+    return (
+        (text or "")
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+    )
 
-#     # ---------- Build a compact inner HTML body ----------
-#     desc         = (answer_json.get("query_description") or "Results Summary")
-#     db_total     = int(answer_json.get("db_total_rows", 0) or 0)
-#     csv_rows     = int(answer_json.get("csv_rows", 0) or 0)
-#     shown        = int(answer_json.get("shown_rows", 0) or 0)
-#     teams_cut    = max(csv_rows - shown, 0)
-#     csv_cut      = max(db_total - csv_rows, 0)
+def chunk_text(s: str, limit: int = 2400):
+    """
+    Split long SQL into chunks so each TextBlock stays under card limits.
+    (Teams/Adaptive Cards can truncate overly long TextBlocks.)
+    """
+    s = s or ""
+    return [s[i:i+limit] for i in range(0, len(s), limit)]
 
-#     # tiny preview table (<=5 rows, <=6 cols)
-#     stmt     = answer_json.get("statement_response", {}) or {}
-#     result   = (stmt.get("result") or {})
-#     rows     = (result.get("data_array") or [])
-#     manifest = (stmt.get("manifest") or {})
-#     schema   = ((manifest.get("schema") or {}).get("columns") or [])
+# def build_sql_toggle_card(
+#     raw_sql: str,
+#     conversation_id: str,
+#     truncated: bool,
+#     # RE-ENABLE FOR EMAIL GRAPH SOLUTION
+#     user_id: str
+# ) -> Attachment:
+#     # 1) base card
+#     card = {
+#       "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+#       "type": "AdaptiveCard",
+#       "version": "1.5",
+#       "body": [
+#         {
+#           "type": "Container",
+#           "id": "sqlContainer",
+#           "isVisible": False,
+#           "items": [
+#             {"type": "TextBlock", "text": "**Generated SQL**", "weight": "Bolder"},
+#             {"type": "TextBlock", "text": raw_sql, "wrap": True}
+#           ]
+#         }
+#       ],
+#       # start with just the Show SQL button
+#       "actions": [
+#         {
+#             "type": "Action.ToggleVisibility",
+#             "title": "Show SQL",
+#             "targetElements": ["sqlContainer"]
+#         },
 
-#     max_cols = 6
-#     max_rows = 5
-#     cols     = [c.get("name", f"Col{i}") for i, c in enumerate(schema[:max_cols])]
-#     tiny_rows = []
-#     for r in rows[:max_rows]:
-#         tiny_rows.append([ "NULL" if v is None else str(v) for v in r[:max_cols] ])
+#         {
+#             "type":  "Action.OpenUrl",
+#             "title": "Show Chart",
+#             "url":   f"{DASH_URL}/chart?session={conversation_id}"
+#         },
+#         {
+#             # RE-ENABLE FOR EMAIL GRAPH SOLUTION
+#             "type": "Action.OpenUrl",
+#             "title": "Summarize & Draft Email",
+#             "url": f"{BOT_URL}/graph/login?session={conversation_id}&user={user_id}"
+#             # "type": "Action.OpenUrl",
+#             # "title": "Summarize & Draft Email",
+#             # "url": build_owa_compose_url(SESSION_DATA.get(conversation_id, {}), conversation_id)
+#         }
+#       ]
+#     }
 
-#     def html_table(cols, data):
-#         if not cols or not data:
-#             return ""
-#         thead = "".join(f'<th style="border:1px solid #ddd;padding:6px;background:#f5f5f5;text-align:left">{quote(str(c))}</th>' for c in cols)
-#         body_rows = []
-#         for rr in data:
-#             tds = "".join(f'<td style="border:1px solid #ddd;padding:6px">{quote(str(v))}</td>' for v in rr)
-#             body_rows.append(f"<tr>{tds}</tr>")
-#         return (
-#             '<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #ddd;margin-top:8px">'
-#             f"<thead><tr>{thead}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
-#         )
+#     # 2) conditionally add the Download CSV button
+#     if truncated:
+#         card["actions"].append({
+#           "type":  "Action.OpenUrl",
+#           "title": "Download CSV",
+#           "url":   f"{BOT_URL}/download_csv?session={conversation_id}"
+#         })
 
-#     csv_link = f"{BOT_URL}/download_csv?session={conversation_id}"
-#     trunc_bits = []
-#     if teams_cut:
-#         trunc_bits.append(f"Teams view truncated: <strong>{teams_cut:,}</strong>")
-#     if csv_cut:
-#         trunc_bits.append(f"CSV capped by Genie: <strong>{csv_cut:,}</strong>")
-#     trunc_html = ""
-#     if trunc_bits:
-#         trunc_html = "<ul>" + "".join(f"<li>{b}</li>" for b in trunc_bits) + "</ul>"
-
-#     inner_html = (
-#         # top padding for notes
-#         '<p style="margin:0 0 12px 0;">&nbsp;</p>'
-#         '<p style="margin:0 0 12px 0;">&nbsp;</p>'
-#         '<p style="margin:0 0 12px 0;">&nbsp;</p>'
-#         '<h2 style="margin:0 0 12px 0;">Results Summary</h2>'
-#         f'<p style="margin:0 0 10px 0"><a href="{csv_link}">Download CSV</a></p>'
-#         f"<p><strong>Description:</strong> {desc}</p>"
-#         f"<p><strong>Total rows in dataset:</strong> {db_total:,}</p>"
-#         f"<p><strong>Rows shown in Teams:</strong> {shown:,} &nbsp; <strong>Rows in CSV:</strong> {csv_rows:,}</p>"
-#         f"{trunc_html}"
-#         f"{html_table(cols, tiny_rows)}"
+#     # 3) wrap and return
+#     return Attachment(
+#       content_type="application/vnd.microsoft.card.adaptive",
+#       content=card
 #     )
-
-#     # Remove any accidental whitespace between tags to shorten URL
-#     inner_html = re.sub(r">\s+<", "><", inner_html).strip()
-
-#     base = "https://outlook.office.com/owa/?path=/mail/action/compose"
-
-#     def make_url(body_html: str, subj: str) -> str:
-#         # Encode everything so spaces -> %20 and HTML is preserved
-#         qs = (
-#             f"subject={quote(subj, safe='')}"
-#             f"&body={quote(body_html, safe='')}"
-#             f"&bodyIsHtml=true&contentType=html"
-#         )
-#         return f"{base}&{qs}"
-
-#     url = make_url(inner_html, subject)
-
-#     # If somehow still long, drop the table and try again
-#     if len(url) > OWA_MAX_URL_LEN:
-#         minimal = re.sub(r"<table[\s\S]*?</table>", "", inner_html, flags=re.IGNORECASE)
-#         url = make_url(minimal, subject)
-
-#     # Final fallback: header + CSV link only
-#     if len(url) > OWA_MAX_URL_LEN:
-#         tiny = (
-#             '<h2 style="margin:0 0 12px 0;">Results Summary</h2>'
-#             f'<p style="margin:0 0 10px 0"><a href="{csv_link}">Download CSV</a></p>'
-#         )
-#         url = make_url(tiny, subject)
-
-#     return url
 
 def build_sql_toggle_card(
     raw_sql: str,
     conversation_id: str,
     truncated: bool,
-    # RE-ENABLE FOR EMAIL GRAPH SOLUTION
     user_id: str
 ) -> Attachment:
-    # 1) base card
+    pretty_sql = format_sql_for_card(raw_sql)
+    safe_sql   = escape_md_for_card(pretty_sql)
+    chunks     = chunk_text(safe_sql, limit=2400)
+
+    # Base card
     card = {
       "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
       "type": "AdaptiveCard",
@@ -809,37 +1036,32 @@ def build_sql_toggle_card(
           "id": "sqlContainer",
           "isVisible": False,
           "items": [
-            {"type": "TextBlock", "text": "**Generated SQL**", "weight": "Bolder"},
-            {"type": "TextBlock", "text": raw_sql, "wrap": True}
+            {"type": "TextBlock", "text": "**Generated SQL**", "weight": "Bolder"}
+          ] + [
+            {
+              "type": "TextBlock",
+              "text": chunk,
+              "wrap": True,
+              "fontType": "Monospace",     # ← IDE-like look
+              "spacing": "Small"
+            } for chunk in chunks
           ]
         }
       ],
-      # start with just the Show SQL button
       "actions": [
         {
-            "type": "Action.ToggleVisibility",
-            "title": "Show SQL",
-            "targetElements": ["sqlContainer"]
-        },
-
-        {
-            "type":  "Action.OpenUrl",
-            "title": "Show Chart",
-            "url":   f"{DASH_URL}/chart?session={conversation_id}"
+          "type": "Action.ToggleVisibility",
+          "title": "Show SQL",
+          "targetElements": ["sqlContainer"]
         },
         {
-            # RE-ENABLE FOR EMAIL GRAPH SOLUTION
-            "type": "Action.OpenUrl",
-            "title": "Summarize & Draft Email",
-            "url": f"{BOT_URL}/graph/login?session={conversation_id}&user={user_id}"
-            # "type": "Action.OpenUrl",
-            # "title": "Summarize & Draft Email",
-            # "url": build_owa_compose_url(SESSION_DATA.get(conversation_id, {}), conversation_id)
+          "type":  "Action.OpenUrl",
+          "title": "Show Chart",
+          "url":   f"{DASH_URL}/chart?session={conversation_id}"
         }
       ]
     }
 
-    # 2) conditionally add the Download CSV button
     if truncated:
         card["actions"].append({
           "type":  "Action.OpenUrl",
@@ -847,7 +1069,6 @@ def build_sql_toggle_card(
           "url":   f"{BOT_URL}/download_csv?session={conversation_id}"
         })
 
-    # 3) wrap and return
     return Attachment(
       content_type="application/vnd.microsoft.card.adaptive",
       content=card
@@ -949,6 +1170,17 @@ class MyBot(ActivityHandler):
         self.conversation_ids: Dict[str, str] = {}
         self.user_state: Dict[str, Dict] = {}
 
+    async def _typing_pump(self, turn_context: TurnContext, interval: float = TYPING_INTERVAL):
+        """
+        Periodically send a 'typing' activity until cancelled.
+        """
+        while True:
+            try:
+                await turn_context.send_activity(Activity(type=ActivityTypes.typing))
+            except Exception:
+                logger.exception("Typing pump failed to send typing activity")
+            await asyncio.sleep(interval)
+
     async def on_message_activity(self, turn_context: TurnContext):
         user_id = turn_context.activity.from_property.id
         # await turn_context.send_activity(MessageFactory.text("Processing request…"))
@@ -963,7 +1195,8 @@ class MyBot(ActivityHandler):
 
         question = turn_context.activity.text
 
-        await turn_context.send_activity(Activity(type=ActivityTypes.typing))
+        # await turn_context.send_activity(Activity(type=ActivityTypes.typing))
+        typing_task = asyncio.create_task(self._typing_pump(turn_context, interval=TYPING_INTERVAL))
 
         try:
             # 1) call Genie
@@ -1011,6 +1244,10 @@ class MyBot(ActivityHandler):
                 "❗️ I’m sorry—I ran into an unexpected error processing your request. "
                 "Please try again in a moment."
             )
+        finally:
+            typing_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await typing_task
 
     async def on_members_added_activity(self, members_added: List[ChannelAccount], turn_context: TurnContext):
         for member in members_added:
@@ -1018,6 +1255,193 @@ class MyBot(ActivityHandler):
                 await turn_context.send_activity("Welcome to the Supply Chain KNOWLEDGE Agent!")
 
 BOT = MyBot()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) NEW: High-level helper that creates the draft for a session
+# ─────────────────────────────────────────────────────────────────────────────
+# async def _create_draft_for_session(user_id: str, session: str) -> web.Response:
+#     """
+#     Uses an existing/refreshable token for user_id to create the Outlook draft for a session.
+#     Avoids AAD sign-in if tokens are cached. Applies the 50-row preview/CSV-attachment policy.
+#     """
+#     access_token = _get_valid_access_token(user_id)
+#     if not access_token:
+#         # No token available; caller must send user through /graph/login (AAD)
+#         return web.Response(status=401, text="No cached token; interactive sign-in required.")
+
+#     data = SESSION_DATA.get(session)
+#     if not data:
+#         return web.Response(status=404, text="No session data to summarize.")
+
+#     # Build subject + bodies; attach CSV only when preview omitted
+#     plain_body, html_body, included_preview = build_email_bodies(data)
+#     subject = build_business_subject(data)
+
+#     try:
+#         draft = create_draft_via_graph(access_token, subject, html_body)
+#         msg_id   = draft.get("id")
+#         web_link = draft.get("webLink")
+
+#         if not included_preview:
+#             csv_path = SESSION_FILES.get(session)
+#             if csv_path and os.path.exists(csv_path):
+#                 with open(csv_path, "rb") as f:
+#                     csv_bytes = f.read()
+#                 _ = attach_csv_via_graph(access_token, msg_id, csv_bytes, os.path.basename(csv_path))
+#             else:
+#                 logger.warning("CSV path missing for session %s; skipping attachment", session)
+
+#     except Exception:
+#         logger.exception("Failed to create draft or attach CSV via Graph")
+#         return web.Response(status=500, text="Failed to create Outlook draft.")
+
+#     return web.Response(
+#         text=f"""
+#             <html>
+#                 <body style="font-family:Segoe UI, Arial; margin:20px;">
+#                     <h3>Draft created</h3>
+#                     <p>
+#                         <a href="{web_link}" target="_blank" rel="noopener">
+#                             Open draft in Outlook (web)
+#                         </a>
+#                     </p>
+#                     <p>You can also find it in your Drafts folder in desktop Outlook.</p>
+#                 </body>
+#             </html>
+#         """,
+#         content_type="text/html"
+#     )
+
+async def _create_draft_for_session(user_id: str, session: str) -> web.Response:
+    access_token = _get_valid_access_token(user_id)
+    if not access_token:
+        return web.Response(status=401, text="No cached token; interactive sign-in required.")
+
+    data = SESSION_DATA.get(session)
+    if not data:
+        return web.Response(status=404, text="No session data to summarize.")
+
+    # ---- idempotency key for this user+session
+    key = f"{user_id}:{session}"
+    now = time.time()
+    cached = DRAFTS_BY_KEY.get(key)
+    if cached and (now - cached.get("ts", 0) <= DRAFT_CACHE_TTL):
+        logger.info("Reusing recent draft for %s", key)
+        web_link = cached["web_link"]
+        html = f"""<!doctype html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:Segoe UI, Arial; margin:16px">
+  <h3>Draft created</h3>
+  <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
+  <p>You can also find it in your Drafts folder in desktop Outlook.</p>
+</body></html>"""
+        return web.Response(text=html, content_type="text/html")
+
+    # Ensure only one creator runs for this key at a time
+    lock = _get_draft_lock(key)
+    async with lock:
+        # Double-check inside the lock (another request may have created it)
+        cached = DRAFTS_BY_KEY.get(key)
+        if cached and (time.time() - cached.get("ts", 0) <= DRAFT_CACHE_TTL):
+            logger.info("Reusing recent draft for %s (post-lock)", key)
+            web_link = cached["web_link"]
+            html = f"""<!doctype html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:Segoe UI, Arial; margin:16px">
+  <h3>Draft created</h3>
+  <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
+  <p>You can also find it in your Drafts folder in desktop Outlook.</p>
+</body></html>"""
+            return web.Response(text=html, content_type="text/html")
+
+        # Build subject + bodies; attach CSV only when preview omitted
+        plain_body, html_body, included_preview = build_email_bodies(data)
+        subject = build_business_subject(data)
+
+        try:
+            draft = create_draft_via_graph(access_token, subject, html_body)
+            msg_id   = draft.get("id")
+            web_link = draft.get("webLink")
+
+            if not included_preview:
+                csv_path = SESSION_FILES.get(session)
+                if csv_path and os.path.exists(csv_path):
+                    with open(csv_path, "rb") as f:
+                        csv_bytes = f.read()
+                    _ = attach_csv_via_graph(access_token, msg_id, csv_bytes, os.path.basename(csv_path))
+                else:
+                    logger.warning("CSV path missing for session %s; skipping attachment", session)
+
+            # Cache the result to prevent duplicate drafts for a short window
+            DRAFTS_BY_KEY[key] = {"msg_id": msg_id, "web_link": web_link, "ts": time.time()}
+
+        except Exception:
+            logger.exception("Failed to create draft or attach CSV via Graph")
+            return web.Response(status=500, text="Failed to create Outlook draft.")
+
+    # Success page
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:Segoe UI, Arial; margin:16px">
+  <h3>Draft created</h3>
+  <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
+  <p>You can also find it in your Drafts folder in desktop Outlook.</p>
+</body></html>"""
+    return web.Response(text=html, content_type="text/html")
+
+# Prefer cached token; otherwise interactive login
+async def graph_login(request: web.Request) -> web.Response:
+    session = request.query.get("session") or ""
+    user_id = request.query.get("user") or ""
+    if not session or not user_id:
+        return web.Response(status=400, text="Missing session or user.")
+    if _get_valid_access_token(user_id):
+        raise web.HTTPFound(f"{BOT_URL}/graph/draft?session={session}&user={user_id}")
+    state = json.dumps({"session": session, "user": user_id})
+    raise web.HTTPFound(_oauth_authorize_url(state))
+
+app.router.add_get("/graph/login", graph_login)
+
+# Silent path using cached token
+async def graph_draft(request: web.Request) -> web.Response:
+    session = request.query.get("session") or ""
+    user_id = request.query.get("user") or ""
+    if not session or not user_id:
+        return web.Response(status=400, text="Missing session or user.")
+    return await _create_draft_for_session(user_id, session)
+
+app.router.add_get("/graph/draft", graph_draft)
+
+# After AAD callback, cache tokens then delegate to helper
+async def graph_callback(request: web.Request) -> web.Response:
+    code  = request.query.get("code")
+    state = request.query.get("state")
+    if not code or not state:
+        return web.Response(status=400, text="Missing code or state.")
+    try:
+        s = json.loads(state)
+        session = s["session"]
+        user_id = s["user"]
+    except Exception:
+        return web.Response(status=400, text="Invalid state")
+
+    try:
+        tok = _oauth_token_request({
+            "client_id": MS_CLIENT_ID,
+            "scope": MS_SCOPES,
+            "code": code,
+            "grant_type": "authorization_code",
+            "client_secret": MS_CLIENT_SECRET,
+            "redirect_uri": MS_REDIRECT_URI,
+        })
+        _save_tokens_for_user(user_id, tok)
+    except Exception:
+        logger.exception("Token exchange failed")
+        return web.Response(status=500, text="Failed to sign in to Microsoft Graph.")
+
+    return await _create_draft_for_session(user_id, session)
+
+app.router.add_get("/graph/callback", graph_callback)
 
 async def messages(req: web.Request) -> web.Response:
     if "application/json" in req.headers["Content-Type"]:
@@ -1084,124 +1508,87 @@ if __name__ == "__main__":
     except Exception as error:
         logger.exception("Error running app")
 
-# # Compose .eml draft with HTML + plaintext body and CSV attachment
-# async def compose_eml(request: web.Request) -> web.Response:
-#     session = request.query.get("session")
-#     csv_path = SESSION_FILES.get(session)
-#     data     = SESSION_DATA.get(session)
+# # RE-ENABLE FOR EMAIL GRAPH SOLUTION
+# # # Kick off login; carry session + user in state
+# async def graph_login(request: web.Request) -> web.Response:
+#     session = request.query.get("session") or ""
+#     user_id = request.query.get("user") or ""
+#     if not session or not user_id:
+#         return web.Response(status=400, text="Missing session or user.")
+#     state = json.dumps({"session": session, "user": user_id})
+#     return web.HTTPFound(_oauth_authorize_url(state))
 
+# app.router.add_get("/graph/login", graph_login)
+
+# # # OAuth callback: exchange code, create draft, attach CSV, show link
+# async def graph_callback(request: web.Request) -> web.Response:
+#     code  = request.query.get("code")
+#     state = request.query.get("state")
+#     if not code or not state:
+#         return web.Response(status=400, text="Missing code or state.")
+#     try:
+#         s = json.loads(state); session = s["session"]; user_id = s["user"]
+#     except Exception:
+#         return web.Response(status=400, text="Invalid state")
+
+#     try:
+#         tok = _oauth_token_request({
+#             "client_id": MS_CLIENT_ID,
+#             "scope": MS_SCOPES,
+#             "code": code,
+#             "grant_type": "authorization_code",
+#             "client_secret": MS_CLIENT_SECRET,
+#             "redirect_uri": MS_REDIRECT_URI,
+#         })
+#         _save_tokens_for_user(user_id, tok)
+#         access_token = tok["access_token"]
+#     except Exception:
+#         logger.exception("Token exchange failed")
+#         return web.Response(status=500, text="Failed to sign in to Microsoft Graph.")
+
+#     # Load session data (required for email body); CSV is optional now
+#     data = SESSION_DATA.get(session)
 #     if not data:
 #         return web.Response(status=404, text="No session data to summarize.")
-#     if not csv_path or not os.path.exists(csv_path):
-#         return web.Response(status=404, text="No CSV available for this session.")
 
-#     # Build bodies and subject
-#     text_body, html_body = build_email_bodies(data)
+#     # Build subject + bodies (HTML + plaintext policy inside helper)
+#     plain_body, html_body, included_preview = build_email_bodies(data)
 #     subject = build_email_subject(data)
 
-#     # Create the email draft (compose mode)
-#     msg = EmailMessage()
-#     msg["Subject"] = subject
-#     msg["X-Unsent"] = "1"  # critical: open as draft in Outlook
-#     # Leave From/To/Date unset so Outlook treats it as a new draft
-
-#     # Bodies: plaintext then HTML (Outlook prefers HTML)
-#     msg.set_content(text_body)
-#     msg.add_alternative(html_body, subtype="html")
-
-#     # Attach CSV
 #     try:
-#         with open(csv_path, "rb") as f:
-#             csv_bytes = f.read()
-#         msg.add_attachment(
-#             csv_bytes,
-#             maintype="text",
-#             subtype="csv",
-#             filename=os.path.basename(csv_path),
-#         )
+#         # 1) Create the draft with HTML body
+#         draft = create_draft_via_graph(access_token, subject, html_body)
+#         msg_id   = draft.get("id")
+#         web_link = draft.get("webLink")
+
+#         # 2) Attach CSV ONLY when preview was omitted (i.e., total rows > 50)
+#         if not included_preview:
+#             csv_path = SESSION_FILES.get(session)
+#             if csv_path and os.path.exists(csv_path):
+#                 with open(csv_path, "rb") as f:
+#                     csv_bytes = f.read()
+#                 _ = attach_csv_via_graph(
+#                     access_token,
+#                     msg_id,
+#                     csv_bytes,
+#                     os.path.basename(csv_path)
+#                 )
+#             else:
+#                 logger.warning("CSV path missing for session %s; skipping attachment", session)
+
 #     except Exception:
-#         logger.exception("Failed attaching CSV to EML")
-#         return web.Response(status=500, text="Failed to attach CSV.")
+#         logger.exception("Failed to create draft or attach CSV via Graph")
+#         return web.Response(status=500, text="Failed to create Outlook draft.")
 
-#     # Serialize to .eml and return as a download
-#     tf = tempfile.NamedTemporaryFile(delete=False, suffix=".eml", dir="/tmp")
-#     with open(tf.name, "wb") as emlfile:
-#         emlfile.write(bytes(msg))
-
-#     return web.FileResponse(
-#         tf.name,
-#         headers={"Content-Disposition": 'attachment; filename="results-draft.eml"'}
+#     return web.Response(
+#         text=(
+#             f"""<html><body style="font-family:Segoe UI, Arial">
+#                  <h3>Draft created</h3>
+#                  <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
+#                  <p>You can also find it in your Drafts folder in desktop Outlook.</p>
+#                </body></html>"""
+#         ),
+#         content_type="text/html"
 #     )
 
-# # Route
-# app.router.add_get("/compose_eml", compose_eml)
-
-# RE-ENABLE FOR EMAIL GRAPH SOLUTION
-# # Kick off login; carry session + user in state
-async def graph_login(request: web.Request) -> web.Response:
-    session = request.query.get("session") or ""
-    user_id = request.query.get("user") or ""
-    if not session or not user_id:
-        return web.Response(status=400, text="Missing session or user.")
-    state = json.dumps({"session": session, "user": user_id})
-    return web.HTTPFound(_oauth_authorize_url(state))
-
-app.router.add_get("/graph/login", graph_login)
-
-# # OAuth callback: exchange code, create draft, attach CSV, show link
-async def graph_callback(request: web.Request) -> web.Response:
-    code  = request.query.get("code")
-    state = request.query.get("state")
-    if not code or not state:
-        return web.Response(status=400, text="Missing code or state.")
-    try:
-        s = json.loads(state); session = s["session"]; user_id = s["user"]
-    except Exception:
-        return web.Response(status=400, text="Invalid state")
-
-    try:
-        tok = _oauth_token_request({
-            "client_id": MS_CLIENT_ID,
-            "scope": MS_SCOPES,
-            "code": code,
-            "grant_type": "authorization_code",
-            "client_secret": MS_CLIENT_SECRET,
-            "redirect_uri": MS_REDIRECT_URI,
-        })
-        _save_tokens_for_user(user_id, tok)
-        access_token = tok["access_token"]
-    except Exception:
-        logger.exception("Token exchange failed")
-        return web.Response(status=500, text="Failed to sign in to Microsoft Graph.")
-
-    csv_path = SESSION_FILES.get(session)
-    data     = SESSION_DATA.get(session)
-    if not data:
-        return web.Response(status=404, text="No session data to summarize.")
-    if not csv_path or not os.path.exists(csv_path):
-        return web.Response(status=404, text="No CSV available for this session.")
-
-    text_body, html_body = build_email_bodies(data)
-    subject = build_email_subject(data)
-
-    try:
-        draft = create_draft_via_graph(access_token, subject, html_body)
-        msg_id  = draft.get("id")
-        web_link= draft.get("webLink")
-        with open(csv_path, "rb") as f:
-            csv_bytes = f.read()
-        _ = attach_csv_via_graph(access_token, msg_id, csv_bytes, os.path.basename(csv_path))
-    except Exception:
-        logger.exception("Failed to create draft or attach CSV via Graph")
-        return web.Response(status=500, text="Failed to create Outlook draft.")
-
-    return web.Response(
-        text=f"""<html><body style="font-family:Segoe UI, Arial">
-                 <h3>Draft created</h3>
-                 <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
-                 <p>You can also find it in your Drafts folder in desktop Outlook.</p>
-                 </body></html>""",
-        content_type="text/html"
-    )
-
-app.router.add_get("/graph/callback", graph_callback)
+# app.router.add_get("/graph/callback", graph_callback)
