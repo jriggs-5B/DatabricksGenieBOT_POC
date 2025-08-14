@@ -12,6 +12,8 @@ logger = logging.getLogger("dash_service")
 # URL where your bot is listening (override via env var if needed)
 BOT_URL = os.environ["BOT_URL"]
 
+logger.info("Dash BOT_URL=%s", BOT_URL)
+
 # Flask server to host Dash
 server = Flask(__name__)
 
@@ -137,53 +139,129 @@ def populate_column_dropdowns(url_search):
     ],
     [State("url", "search")]
 )
-
 def update_chart_and_table(chart_type, x_col, y_col, url_search):
     logger.debug(f"Inputs → chart={chart_type!r}, x_col={x_col!r}, y_col={y_col!r}, url={url_search!r}")
     import urllib.parse
 
-    # parse out ?session=xxx
+    def _empty():
+        return {"data": [], "layout": {"margin": {"t": 30, "b": 50}}}, [], []
+
+    # parse ?session=...
     query = urllib.parse.parse_qs((url_search or "").lstrip("?"))
     session = query.get("session", [None])[0]
-    logger.debug(f"🛰️  Dash fetching JSON for session={session}")
+    logger.debug(f"🛰️ Dash fetching JSON for session={session}")
 
-    # fetch data
+    if not session:
+        logger.warning("No session provided in URL.")
+        return _empty()
+    
     resp = requests.get(f"{BOT_URL}/download_json", params={"session": session})
-    logger.debug(f"🛰️  Response {resp.status_code}: {resp.text[:200]}…")
+    logger.debug("GET %s/download_json?session=%s → %s", BOT_URL, session, resp.status_code)
 
-    if resp.status_code != 200 or not session:
-        # nothing to chart
-        return {"data": []}
+    resp = requests.get(f"{BOT_URL}/download_json", params={"session": session})
+    logger.debug(f"🛰️ /download_json status={resp.status_code} body={resp.text[:200]}…")
+    if resp.status_code != 200:
+        logger.warning("download_json returned %s for session=%s", resp.status_code, session)
+        return _empty()
 
-    data = resp.json()
-    cols = [c["name"] for c in data["statement_response"]["manifest"]["schema"]["columns"]]
-    rows = data["statement_response"]["result"]["data_array"]
-    df   = pd.DataFrame(rows, columns=cols)
+    try:
+        data = resp.json()
+        cols = [c["name"] for c in data["statement_response"]["manifest"]["schema"]["columns"]]
+        rows = data["statement_response"]["result"]["data_array"]
+    except Exception:
+        logger.exception("Failed to parse payload")
+        return _empty()
 
-    logger.debug("DF columns: %r", list(df.columns))
-    logger.debug("Requested x_col=%r, y_col=%r", x_col, y_col)
+    if not cols or not rows:
+        logger.warning("No columns or rows in payload")
+        return _empty()
+
+    if not x_col or not y_col or x_col not in cols or y_col not in cols:
+        logger.warning("Invalid x/y selection x=%r y=%r; cols=%r", x_col, y_col, cols)
+        return _empty()
+
+    import pandas as pd
+    df = pd.DataFrame(rows, columns=cols)
 
     if chart_type == "bar":
-        fig_data = [{"type": "bar",  "x": df[x_col], "y": df[y_col]}]
+        fig_data = [{"type": "bar", "x": df[x_col], "y": df[y_col]}]
     elif chart_type == "line":
-        fig_data = [{"type": "line", "x": df[x_col], "y": df[y_col]}]
+        fig_data = [{"type": "scatter", "mode": "lines", "x": df[x_col], "y": df[y_col]}]
     else:
-        fig_data = [{"type": "pie",  "labels": df[x_col], "values": df[y_col]}]
+        fig_data = [{"type": "pie", "labels": df[x_col], "values": df[y_col]}]
 
     fig = {
-      "data": fig_data,
-      "layout": {
-        "margin": {"t": 30, "b": 50},
-        "xaxis": {"title": x_col, "tickangle": -45},
-        "yaxis": {"title": y_col},
-      }  
+        "data": fig_data,
+        "layout": {
+            "margin": {"t": 30, "b": 50},
+            "xaxis": {"title": x_col, "tickangle": -45},
+            "yaxis": {"title": y_col},
+        },
     }
-
-    # prepare table columns+data
     table_columns = [{"name": c, "id": c} for c in df.columns]
     table_data    = df.to_dict("records")
-
     return fig, table_columns, table_data
+
+# @dash_app.callback(
+#     [
+#       Output("main-chart", "figure"),
+#       Output("data-table", "columns"),
+#       Output("data-table", "data"),
+#     ],
+#     [
+#       Input("chart-type", "value"),
+#       Input("x-col",       "value"),
+#       Input("y-col",       "value"),
+#     ],
+#     [State("url", "search")]
+# )
+
+# def update_chart_and_table(chart_type, x_col, y_col, url_search):
+#     logger.debug(f"Inputs → chart={chart_type!r}, x_col={x_col!r}, y_col={y_col!r}, url={url_search!r}")
+#     import urllib.parse
+
+#     # parse out ?session=xxx
+#     query = urllib.parse.parse_qs((url_search or "").lstrip("?"))
+#     session = query.get("session", [None])[0]
+#     logger.debug(f"🛰️  Dash fetching JSON for session={session}")
+
+#     # fetch data
+#     resp = requests.get(f"{BOT_URL}/download_json", params={"session": session})
+#     logger.debug(f"🛰️  Response {resp.status_code}: {resp.text[:200]}…")
+
+#     if resp.status_code != 200 or not session:
+#         # nothing to chart
+#         return {"data": []}
+
+#     data = resp.json()
+#     cols = [c["name"] for c in data["statement_response"]["manifest"]["schema"]["columns"]]
+#     rows = data["statement_response"]["result"]["data_array"]
+#     df   = pd.DataFrame(rows, columns=cols)
+
+#     logger.debug("DF columns: %r", list(df.columns))
+#     logger.debug("Requested x_col=%r, y_col=%r", x_col, y_col)
+
+#     if chart_type == "bar":
+#         fig_data = [{"type": "bar",  "x": df[x_col], "y": df[y_col]}]
+#     elif chart_type == "line":
+#         fig_data = [{"type": "line", "x": df[x_col], "y": df[y_col]}]
+#     else:
+#         fig_data = [{"type": "pie",  "labels": df[x_col], "values": df[y_col]}]
+
+#     fig = {
+#       "data": fig_data,
+#       "layout": {
+#         "margin": {"t": 30, "b": 50},
+#         "xaxis": {"title": x_col, "tickangle": -45},
+#         "yaxis": {"title": y_col},
+#       }  
+#     }
+
+#     # prepare table columns+data
+#     table_columns = [{"name": c, "id": c} for c in df.columns]
+#     table_data    = df.to_dict("records")
+
+#     return fig, table_columns, table_data
 
 if __name__ == "__main__":
     # Use DASH_PORT env var or default to 8050
