@@ -37,6 +37,7 @@ import base64
 from urllib.parse import urlencode, quote
 from contextlib import suppress
 import sqlparse
+from supervisor import supervisor_summarize
 
 # Log for prod
 # logging.basicConfig(level=logging.INFO)
@@ -1080,10 +1081,41 @@ async def _create_draft_for_session(user_id: str, session: str) -> web.Response:
 </body></html>"""
             return web.Response(text=html, content_type="text/html")
 
-        # Build subject + bodies; attach CSV only when preview omitted
-        plain_body, html_body, included_preview = build_email_bodies(data)
-        subject = build_business_subject(data)
+                # ----- Supervisor (LLM) -----
+        try:
+            sup = supervisor_summarize(data)  # {'subject','summary_html','summary_text'}
+            subject_override = (sup.get("subject") or "").strip()
+            summary_html = (sup.get("summary_html") or "").strip()
+            summary_text = (sup.get("summary_text") or "").strip()
+        except Exception:
+            logger.exception("Supervisor failed; proceeding without overrides.")
+            subject_override = ""
+            summary_html = ""
+            summary_text = ""
 
+        # ----- Build bodies (use 50-row rule) -----
+        # Preview inline if TOTAL rows <= 50; otherwise no preview + attach CSV
+        plain_body, html_body, included_preview = build_email_bodies(data, preview_max=PREVIEW_MAX_ROWS)
+
+        # Subject: supervisor override if present; else your existing deterministic subject
+        subject = subject_override or build_business_subject(data)
+
+        # Inject executive summary ONLY if supervisor provided it (LLM enabled and succeeded)
+        if summary_html:
+            html_body = (
+                '<h2 style="margin:0 0 12px 0;">Executive Summary</h2>'
+                f'{summary_html}'
+                '<hr style="border:none;border-top:1px solid #ddd;margin:16px 0;">'
+            ) + html_body
+
+        if summary_text:
+            plain_body = (
+                "Executive Summary\n\n"
+                f"{summary_text}\n"
+                + ("-" * 24) + "\n"
+            ) + plain_body
+
+        # ----- Create draft + optional CSV attachment (unchanged) -----
         try:
             draft = create_draft_via_graph(access_token, subject, html_body)
             msg_id   = draft.get("id")
@@ -1098,8 +1130,28 @@ async def _create_draft_for_session(user_id: str, session: str) -> web.Response:
                 else:
                     logger.warning("CSV path missing for session %s; skipping attachment", session)
 
-            # Cache the result to prevent duplicate drafts for a short window
             DRAFTS_BY_KEY[key] = {"msg_id": msg_id, "web_link": web_link, "ts": time.time()}
+
+        # # Build subject + bodies; attach CSV only when preview omitted
+        # plain_body, html_body, included_preview = build_email_bodies(data)
+        # subject = build_business_subject(data)
+
+        # try:
+        #     draft = create_draft_via_graph(access_token, subject, html_body)
+        #     msg_id   = draft.get("id")
+        #     web_link = draft.get("webLink")
+
+        #     if not included_preview:
+        #         csv_path = SESSION_FILES.get(session)
+        #         if csv_path and os.path.exists(csv_path):
+        #             with open(csv_path, "rb") as f:
+        #                 csv_bytes = f.read()
+        #             _ = attach_csv_via_graph(access_token, msg_id, csv_bytes, os.path.basename(csv_path))
+        #         else:
+        #             logger.warning("CSV path missing for session %s; skipping attachment", session)
+
+        #     # Cache the result to prevent duplicate drafts for a short window
+        #     DRAFTS_BY_KEY[key] = {"msg_id": msg_id, "web_link": web_link, "ts": time.time()}
 
         except Exception:
             logger.exception("Failed to create draft or attach CSV via Graph")
