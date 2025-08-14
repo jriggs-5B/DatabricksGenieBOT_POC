@@ -36,6 +36,30 @@ try:
 except Exception:  # pragma: no cover
     OpenAI = None  # handled at call time
 
+import inspect
+from openai import OpenAI
+_client = OpenAI()
+import openai as _pkg
+logger.warning("SUP: chat.completions.create signature=%s",
+               inspect.signature(_client.chat.completions.create))
+
+def _first_json_object(text: str) -> str:
+    """Return the first balanced {...} JSON object from a string, or ''."""
+    if not text:
+        return ""
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    return text[start:i+1]
+    return ""
 
 # ---------------- Sanitization ----------------
 # Keep HTML strictly limited; strip attributes and unknown tags
@@ -146,55 +170,69 @@ def supervisor_summarize(answer_json: Dict[str, Any]) -> Dict[str, str]:
         return _empty_overrides()
 
     try:
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))     
         content = _pack_dataset(answer_json)
-
-        messages = [
-            {"role": "system", "content": _SUPERVISOR_SYSTEM},
-            {"role": "user", "content": json.dumps(content, ensure_ascii=False)}
-        ]
-
-        resp = client.responses.create(
-            model=LLM_MODEL,
-            input=messages,
-            temperature=0.2,
-            max_output_tokens=800,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "SupervisorSummary",
-                    "schema": _SUPERVISOR_SCHEMA,
-                    "strict": True,
-                }
-            },
-            timeout=LLM_TIMEOUT_S,
+        prompt = (
+            _SUPERVISOR_SYSTEM
+            + "\n\n"
+            + "You will receive a JSON payload with dataset context.\n"
+            + "Return ONLY a JSON object with EXACTLY these keys:\n"
+            + "  - subject (string, <= 120 chars)\n"
+            + "  - summary_html (string; allowed tags: <p>, <ul>, <li>, <strong>, <em>)\n"
+            + "  - summary_text (string)\n"
+            + "No prose, no code fences, no extra keys.\n\n"
+            + "PAYLOAD:\n"
+            + json.dumps(content, ensure_ascii=False)
         )
 
-        # Prefer parsed output if available
-        parsed = getattr(getattr(resp, "output", None), "parsed", None)
-        if parsed is None:
-            # Fallback: try to locate text content and parse it
-            text_blob = None
-            out = getattr(resp, "output", None) or []
+        # 1) Responses API with a single string input (no content parts, no response_format)
+        resp = client.responses.create(
+            model=LLM_MODEL,
+            input=prompt,
+            max_output_tokens=800,   # supported on Responses API
+            # temperature omitted (defaults are fine in your runtime)
+        )
+
+        # 2) Collect response text (covers both modern and older SDK shapes)
+        text_out = ""
+        out = getattr(resp, "output", None)
+
+        if isinstance(out, list):
+            # Modern 1.x often returns a list of items with messages/content blocks
+            parts = []
             for item in out:
                 if getattr(item, "type", "") == "message":
-                    for c in (item.content or []):
-                        if getattr(c, "type", "") == "output_text":
-                            text_blob = c.text
-                            break
-                if text_blob:
-                    break
-            parsed = json.loads(text_blob or "{}")
+                    for c in getattr(item, "content", []) or []:
+                        t = getattr(c, "type", "")
+                        if t in ("output_text", "text"):
+                            parts.append(getattr(c, "text", "") or "")
+            text_out = "".join(parts).strip()
 
-        # Final sanitize & trim
-        subj = (parsed.get("subject") or "").strip()[:120]
-        s_html = _sanitize_html(parsed.get("summary_html") or "")
-        s_text = (parsed.get("summary_text") or "").strip()
+        # Fallbacks: older shapes / convenience properties
+        if not text_out:
+            # Some builds expose convenience properties
+            text_out = getattr(resp, "output_text", "") or getattr(resp, "content", "") or ""
+            text_out = (text_out or "").strip()
 
-        if not subj or not (s_html and s_text):
-            raise ValueError("Structured output missing required fields")
+        # 3) Parse first JSON object from the text
+        blob = _first_json_object(text_out)
+        if not blob:
+            logger.warning("SUP: no JSON found in Responses text (len=%s)", len(text_out))
+            raise ValueError("empty content")
 
-        return {"subject": subj, "summary_html": s_html, "summary_text": s_text}
+        parsed = json.loads(blob)
+
+        # 4) Sanitize + validate
+        subject = (parsed.get("subject") or "").strip()[:120]
+        summary_html = _sanitize_html(parsed.get("summary_html") or "")
+        summary_text = (parsed.get("summary_text") or "").strip()
+
+        if not subject or not (summary_html and summary_text):
+            logger.warning("SUP: parsed JSON missing keys: %s",
+                        {k: parsed.get(k) for k in ("subject","summary_html","summary_text")})
+            raise ValueError("Supervisor output missing required fields")
+
+        return {"subject": subject, "summary_html": summary_html, "summary_text": summary_text}
 
     except Exception as e:
         logger.exception("LLM supervisor failed; using no-op overrides. Error: %s", e)

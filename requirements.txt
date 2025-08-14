@@ -30,3 +30,6 @@ flask==3.1.0        # if you’re actually using Flask anywhere
 # new charting deps
 dash>=2.0
 plotly>=5.0
+
+# OpenAI SDK
+openai>=1.51.0,<2

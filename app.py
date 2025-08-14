@@ -159,7 +159,6 @@ workspace_client = WorkspaceClient(
     token=DATABRICKS_TOKEN
 )
 
-
 # 2) Register healthz **before** all your other routes
 async def healthz(request):
     return web.Response(status=200)
@@ -168,6 +167,34 @@ app = web.Application()
 app.router.add_get("/healthz", healthz)
 
 genie_api = GenieAPI(workspace_client.api_client)
+
+async def diag_model(request):
+    import json
+    from openai import OpenAI
+    client = OpenAI()
+
+    model_to_test = "gpt-5-nano"
+    try:
+        resp = client.chat.completions.create(
+            model=model_to_test,
+            messages=[{"role":"user","content":"Ping"}],
+            max_completion_tokens=1,
+        )
+        return web.json_response({
+            "status": "ok",
+            "model": model_to_test,
+            "output": resp.choices[0].message.content or "<empty>"
+        })
+    except Exception as e:
+        return web.json_response({
+            "status": "error",
+            "model": model_to_test,
+            "error": str(e)
+        }, status=400)
+
+app.router.add_get("/diag/model", diag_model)
+
+
 
 def get_attachment_query_result(space_id, conversation_id, message_id, attachment_id):
     url = f"{DATABRICKS_HOST}/api/2.0/genie/spaces/{space_id}/conversations/{conversation_id}/messages/{message_id}"
@@ -608,6 +635,20 @@ def build_email_bodies(answer_json: Dict, preview_max: int = PREVIEW_MAX_ROWS) -
 
     include_preview = db_total_rows <= preview_max
 
+    def fmt_cell(val, col_type_name: str | None) -> str:
+        if val is None:
+            return "NULL"
+        t = (col_type_name or "").upper()
+        try:
+            if t in ("DECIMAL", "DOUBLE", "FLOAT", "REAL", "NUMERIC"):
+                return f"{float(val):,.2f}"
+            if t in ("INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "LONG"):
+                return f"{int(float(val)):,.0f}"
+        except Exception:
+            # fall through to str if conversion fails
+            pass
+        return str(val)
+
     # ----------------- PLAINTEXT -----------------
     lines = []
     lines.append("")
@@ -633,7 +674,10 @@ def build_email_bodies(answer_json: Dict, preview_max: int = PREVIEW_MAX_ROWS) -
         lines.append(header_txt)
         lines.append("-" * len(header_txt))
         for r in rows[:min(len(rows), preview_max, 5)]:
-            lines.append(" | ".join("NULL" if v is None else str(v) for v in r))
+            formatted = []
+            for v, c in zip(r, schema):
+                formatted.append(fmt_cell(v, c.get("type_name")))
+            lines.append(" | ".join(formatted))
     else:
         lines.append("")
         lines.append(f"Preview omitted due to size (> {preview_max} rows). CSV attached.")
@@ -643,7 +687,7 @@ def build_email_bodies(answer_json: Dict, preview_max: int = PREVIEW_MAX_ROWS) -
     # ------------------- HTML --------------------
     def esc(s: str) -> str:
         return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
+    
     html_parts = [
         '<p style="margin:0 0 12px 0;">&nbsp;</p>',
         '<p style="margin:0 0 12px 0;">&nbsp;</p>',
@@ -669,10 +713,10 @@ def build_email_bodies(answer_json: Dict, preview_max: int = PREVIEW_MAX_ROWS) -
         )
         body_rows = []
         for r in rows[:preview_max]:
-            tds = "".join(
-                f'<td style="border:1px solid #ddd;padding:6px">{esc("NULL" if v is None else str(v))}</td>'
-                for v in r
-            )
+            cells = []
+            for v, c in zip(r, schema):
+                cells.append(esc(fmt_cell(v, c.get("type_name"))))
+            tds = "".join(f'<td style="border:1px solid #ddd;padding:6px">{cell}</td>' for cell in cells)
             body_rows.append(f"<tr>{tds}</tr>")
         table_html = (
             '<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #ddd;margin-top:8px">'
@@ -845,6 +889,11 @@ def build_sql_toggle_card(
           "type":  "Action.OpenUrl",
           "title": "Show Chart",
           "url":   f"{DASH_URL}/chart?session={conversation_id}"
+        },
+        {
+          "type":  "Action.OpenUrl",
+          "title": "Email Results",
+          "url":   f"{BOT_URL}/graph/login?session={conversation_id}&user={user_id}"
         }
       ]
     }
@@ -1105,8 +1154,19 @@ async def _create_draft_for_session(user_id: str, session: str) -> web.Response:
             html_body = (
                 '<h2 style="margin:0 0 12px 0;">Executive Summary</h2>'
                 f'{summary_html}'
-                '<hr style="border:none;border-top:1px solid #ddd;margin:16px 0;">'
-            ) + html_body
+            )
+        else:
+            # deterministic version
+            html_body = html_body
+
+        # Plain text body: if LLM summary exists, use only that; else fallback
+        if summary_text:
+            plain_body = (
+                "Executive Summary\n\n"
+                f"{summary_text}\n"
+            )
+        else:
+            plain_body = plain_body
 
         if summary_text:
             plain_body = (
