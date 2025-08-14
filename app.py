@@ -29,6 +29,15 @@ from databricks.sdk.service.dashboards import GenieAPI, MessageStatus
 import asyncio
 import requests
 import re
+# from email.message import EmailMessage
+# from email.utils import formatdate
+import html
+# RE-ENABLE FOR EMAIL GRAPH SOLUTION
+import base64
+from urllib.parse import urlencode, quote
+from contextlib import suppress
+import sqlparse
+from supervisor import supervisor_summarize
 
 # Log for prod
 # logging.basicConfig(level=logging.INFO)
@@ -68,12 +77,87 @@ BOT_URL = os.environ["BOT_URL"]
 DATABRICKS_WAREHOUSE_ID = os.getenv("SQL_WAREHOUSE_ID")
 DATABRICKS_CATALOG = os.getenv("DATABRICKS_CATALOG")
 DATABRICKS_SCHEMA  = os.getenv("DATABRICKS_SCHEMA")
+# RE-ENABLE FOR EMAIL GRAPH SOLUTION
+MS_CLIENT_ID     = os.getenv("MicrosoftAppId", "")
+MS_CLIENT_SECRET = os.getenv("MicrosoftAppPassword", "")
+MS_TENANT_ID     = os.getenv("MS_TENANT_ID")  # or your tenant GUID
+MS_REDIRECT_URI  = os.getenv("MS_REDIRECT_URI")         # e.g. https://<bot-host>/graph/callback
+MS_SCOPES        = "openid profile offline_access Mail.ReadWrite"
+GRAPH_TOKENS: Dict[str, Dict[str, str]] = {}
+# OWA_MAX_URL_LEN = 1400  # keep the final URL comfortably below Safe Links limits
+PREVIEW_MAX_ROWS = 50
+TYPING_INTERVAL = 4.0
+DRAFT_CACHE_TTL = 120  # seconds to treat a draft as 'recent'
+DRAFTS_BY_KEY: dict[str, dict] = {}
+
+# ---- Genie per-turn instructions (applied on every message) -----------------
+# Toggle with GENIE_INSTRUCTIONS_ENABLED=1 to enable; leave unset/0 to disable.
+GENIE_INSTRUCTIONS_ENABLED = os.getenv("GENIE_INSTRUCTIONS_ENABLED", "1") == "1"
+
+GENIE_INSTRUCTIONS = """\
+INSTRUCTIONS (SQL Authoring Rules)
+- Always use ILIKE (never LIKE).
+- Never use SELECT *.
+- For counts, use DISTINCT counts unless explicitly told otherwise.
+- Never show more than 20 columns in the result.
+- Fiscal year starts in February.
+
+Business Semantics & Definitions
+- "Order" = purchase order.
+- Order due date to DC = PO_ANTICIPATE_DT.
+- Cargo ready delay when Target_Cargo_Ready_DT < Latest_Vendor_Cargo_Ready_DT;
+  delay = Latest_Vendor_Cargo_Ready_DT - Target_Cargo_Ready_DT.
+- Delay to ship center/DC compares PO_ANTICIPATE_DT to SUGGESTED_NEW_ANTICIPATE_DT;
+  delay = SUGGESTED_NEW_ANTICIPATE_DT - PO_ANTICIPATE_DT and must be non-negative.
+- Domestic orders: FOB_TYPE_CD IN ('DOMESTIC PREPAID','DOMESTIC COLLECT').
+- Import orders: FOB_TYPE_CD = 'IMPORT'.
+- Bookings are due when booked_dt IS NULL and current_date > REQUEST_DT + 21 days.
+- Orders are past due to ship if REQUEST_DT > current_date.
+- Import orders departed late if Actual departed date > (PO ship date + 7 days).
+- Container is unassigned if container_no IS NULL or blank.
+- Set is determined by PRIORITY_CD.
+- Container on-time if max(SUGGESTED_NEW_ANTICIPATE_DT) < min(PO_ANTICIPATE_DT); otherwise late.
+
+Column/Term Mappings
+- Ocean lane = Port of origin → Port of discharge.
+- DC = LOCATION_NO in inbound_po_supply_chain_20250721.
+- DC = DELIVERY_ADDRESS_TXT in inbound_otw_report_20250721.
+- Port of Discharge / Discharge Port = FIRST_DISCHARGE_NAME.
+
+Counting Rules
+- When counting containers, always COUNT(DISTINCT container_no).
+
+FEU / TEU Logic
+- FEU = forty-foot equivalent unit.
+- If booked_date IS NULL:   FEU = Ordered_Line_Volume / 61
+  Else:                      FEU = Booked_Line_Volume / 61
+
+Data Quality
+- Delay Reason code must NOT be blank if ETD is after PO ship date.
+
+Lead Time & OTIF
+- Average lead time = ACTUAL_DC_ARRIVAL_DT - ORDER_DT.
+- OTIF = On-Time and In Full; an order is OTIF when received in full AND on time.
+- On time if ACTUAL_DC_ARRIVAL_DT <= PO_ANTICIPATE_DT.
+- In full if ORDERED_QTY <= RECEIVED_QTY.
+
+Dataset Routing
+- Containers/FEU/TEU/shipments → inbound_otw_report_20250721.
+- Orders → inbound_po_supply_chain_20250721.
+- Receipts / received orders → inbound_otw_report_20250721.
+
+Apply all rules above when interpreting the request and generating SQL.
+"""
+
+logger.info(
+    "Graph config at startup: client_id=%r tenant=%r redirect=%r",
+    MS_CLIENT_ID, MS_TENANT_ID, MS_REDIRECT_URI
+)
 
 workspace_client = WorkspaceClient(
     host=DATABRICKS_HOST,
     token=DATABRICKS_TOKEN
 )
-
 
 # 2) Register healthz **before** all your other routes
 async def healthz(request):
@@ -83,6 +167,34 @@ app = web.Application()
 app.router.add_get("/healthz", healthz)
 
 genie_api = GenieAPI(workspace_client.api_client)
+
+async def diag_model(request):
+    import json
+    from openai import OpenAI
+    client = OpenAI()
+
+    model_to_test = "gpt-5-nano"
+    try:
+        resp = client.chat.completions.create(
+            model=model_to_test,
+            messages=[{"role":"user","content":"Ping"}],
+            max_completion_tokens=1,
+        )
+        return web.json_response({
+            "status": "ok",
+            "model": model_to_test,
+            "output": resp.choices[0].message.content or "<empty>"
+        })
+    except Exception as e:
+        return web.json_response({
+            "status": "error",
+            "model": model_to_test,
+            "error": str(e)
+        }, status=400)
+
+app.router.add_get("/diag/model", diag_model)
+
+
 
 def get_attachment_query_result(space_id, conversation_id, message_id, attachment_id):
     url = f"{DATABRICKS_HOST}/api/2.0/genie/spaces/{space_id}/conversations/{conversation_id}/messages/{message_id}"
@@ -158,6 +270,16 @@ def get_attachment_query_result(space_id, conversation_id, message_id, attachmen
         logger.error(f"Failed to process Genie API response: {e}, text: {response.text}")
         return {}
 
+
+# Per-key async locks to avoid race conditions when two hits arrive at once
+_DRAFT_LOCKS: dict[str, asyncio.Lock] = {}
+def _get_draft_lock(key: str) -> asyncio.Lock:
+    lock = _DRAFT_LOCKS.get(key)
+    if not lock:
+        lock = asyncio.Lock()
+        _DRAFT_LOCKS[key] = lock
+    return lock
+
 def execute_attachment_query(space_id, conversation_id, message_id, attachment_id, payload):
     url = f"{DATABRICKS_HOST}/genie/spaces/{space_id}/conversations/{conversation_id}/messages/{message_id}/attachments/{attachment_id}/execute-query"
     headers = {
@@ -227,14 +349,11 @@ def count_total_rows_via_sql_warehouse(raw_sql: str) -> Optional[int]:
 
     return None
 
-# def build_count_sql(raw_sql: str) -> str:
-#     """
-#     Exact-count wrapper: do not strip anything except a trailing semicolon.
-#     """
-#     if not raw_sql:
-#         return "SELECT 0 AS total_count"
-#     sql = raw_sql.strip().rstrip(";")
-#     return f"SELECT COUNT(*) AS total_count FROM (\n{sql}\n) AS t"
+def _compose_genie_prompt(user_question: str) -> str:
+    if not GENIE_INSTRUCTIONS_ENABLED:
+        return user_question
+    # Keep it simple and deterministic (no markdown blocks needed).
+    return f"{GENIE_INSTRUCTIONS}\nREQUEST:\n{user_question}"
 
 logger = logging.getLogger(__name__)
 
@@ -251,16 +370,19 @@ async def ask_genie(
         # ───────────────────────────────────────────────────────────────────────────
         # 1) start or continue conversation
         # ───────────────────────────────────────────────────────────────────────────
+        # Compose prompt with per-turn instructions
+        composed_question = _compose_genie_prompt(question)
+
         if conversation_id is None:
             initial_message = await loop.run_in_executor(
-                None, genie_api.start_conversation_and_wait, space_id, question
+                None, genie_api.start_conversation_and_wait, space_id, composed_question
             )
             conversation_id = initial_message.conversation_id
         else:
             initial_message = await loop.run_in_executor(
                 None,
                 genie_api.create_message_and_wait,
-                space_id, conversation_id, question
+                space_id, conversation_id, composed_question
             )
 
         message_id = initial_message.message_id
@@ -454,9 +576,6 @@ async def ask_genie(
                     
                     return json.dumps(answer_json), conversation_id
 
-                    # logger.debug("🚀 FINAL GENIE PAYLOAD: %r", payload)
-                    # return json.dumps(payload), conversation_id
-
         # ────────────────
         # Fallback if no attachments at all
         # ────────────────
@@ -466,13 +585,278 @@ async def ask_genie(
         logger.error(f"Error in ask_genie: {e}", exc_info=True)
         return json.dumps({"error": "An error occurred while processing your request."}), conversation_id
 
+SUBJECT_PREFIX = "Five Below - "
+SUBJECT_MAX = 72  # keep it inbox-friendly
+
+def build_business_subject(answer_json: Dict) -> str:
+    desc = (answer_json.get("query_description") or "").strip()
+    if not desc:
+        return SUBJECT_PREFIX + "Results Summary"
+
+    # trim boilerplate words
+    desc = re.sub(r"\b(this|a|an|the|of|for|to|that|which)\b", "", desc, flags=re.I)
+    desc = re.sub(r"\s+", " ", desc).strip(" -—:.,")
+    # kill quotes/brackets that clutter subjects
+    desc = desc.replace('"', '').replace("'", "").replace("[", "").replace("]", "")
+    subj = SUBJECT_PREFIX + desc
+
+    # nicely truncate on word boundary
+    if len(subj) > SUBJECT_MAX:
+        cut = subj[:SUBJECT_MAX].rsplit(" ", 1)[0]
+        subj = cut + "…"
+    return subj
+
+def build_email_bodies(answer_json: Dict, preview_max: int = PREVIEW_MAX_ROWS) -> tuple[str, str, bool]:
+    """
+    Build both PLAINTEXT and HTML versions of the email body from the Genie `answer_json`.
+
+    Policy:
+      • If TOTAL rows ≤ preview_max (default 50): include a preview table (no CSV attachment).
+      • If TOTAL rows  > preview_max: omit preview table (CSV should be attached by caller).
+
+    Returns: (plain_body, html_body, included_preview)
+      - included_preview == True → NO attachment should be added by the caller
+      - included_preview == False → Caller should attach CSV
+    """
+    # Sizes computed earlier in ask_genie
+    db_total_rows   = int(answer_json.get("db_total_rows") or 0)
+    csv_rows        = int(answer_json.get("csv_rows") or 0)
+    shown_rows      = int(answer_json.get("shown_rows") or 0)
+    teams_truncated = int(answer_json.get("teams_truncated") or 0)
+    csv_truncated   = int(answer_json.get("csv_truncated") or 0)
+
+    desc     = (answer_json.get("query_description") or "Results Summary").strip()
+    stmt     = answer_json.get("statement_response", {}) or {}
+    result   = (stmt.get("result") or {})
+    rows     = (result.get("data_array") or [])
+    manifest = (stmt.get("manifest") or {})
+    schema   = ((manifest.get("schema") or {}).get("columns") or [])
+    col_names: List[str] = [c.get("name", f"Col{i}") for i, c in enumerate(schema)]
+
+    include_preview = db_total_rows <= preview_max
+
+    def fmt_cell(val, col_type_name: str | None) -> str:
+        if val is None:
+            return "NULL"
+        t = (col_type_name or "").upper()
+        try:
+            if t in ("DECIMAL", "DOUBLE", "FLOAT", "REAL", "NUMERIC"):
+                return f"{float(val):,.2f}"
+            if t in ("INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "LONG"):
+                return f"{int(float(val)):,.0f}"
+        except Exception:
+            # fall through to str if conversion fails
+            pass
+        return str(val)
+
+    # ----------------- PLAINTEXT -----------------
+    lines = []
+    lines.append("")
+    lines.append("")
+    lines.append("")
+    lines.append("Results Summary")
+    lines.append("")
+    lines.append(f"Description: {desc}")
+    lines.append(f"Total rows in dataset: {db_total_rows:,}")
+    lines.append(f"Rows shown in Teams: {shown_rows:,}")
+    lines.append(f"Rows in CSV: {csv_rows:,}")
+    if teams_truncated:
+        lines.append(f"Teams view truncated: {teams_truncated:,}")
+    if csv_truncated:
+        lines.append(f"CSV capped by Genie: {csv_truncated:,}")
+    if include_preview:
+        lines.append("")
+        lines.append(f"All rows are shown inline (≤ {preview_max}).")
+        # Optional: add a tiny plaintext preview header and first few lines
+        # (kept minimal since HTML carries the full 50-row preview)
+        header_txt = " | ".join(col_names)
+        lines.append("")
+        lines.append(header_txt)
+        lines.append("-" * len(header_txt))
+        for r in rows[:min(len(rows), preview_max, 5)]:
+            formatted = []
+            for v, c in zip(r, schema):
+                formatted.append(fmt_cell(v, c.get("type_name")))
+            lines.append(" | ".join(formatted))
+    else:
+        lines.append("")
+        lines.append(f"Preview omitted due to size (> {preview_max} rows). CSV attached.")
+
+    plain_body = "\n".join(lines).strip("\n")
+
+    # ------------------- HTML --------------------
+    def esc(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    
+    html_parts = [
+        '<p style="margin:0 0 12px 0;">&nbsp;</p>',
+        '<p style="margin:0 0 12px 0;">&nbsp;</p>',
+        '<p style="margin:0 0 12px 0;">&nbsp;</p>',
+        '<h2 style="margin:0 0 12px 0;">Results Summary</h2>',
+        f"<p><strong>Description:</strong> {esc(desc)}</p>",
+        f"<p><strong>Total rows in dataset:</strong> {db_total_rows:,}</p>",
+        f"<p><strong>Rows shown in Teams:</strong> {shown_rows:,} &nbsp; <strong>Rows in CSV:</strong> {csv_rows:,}</p>",
+    ]
+    if teams_truncated or csv_truncated:
+        html_parts.append("<ul>")
+        if teams_truncated:
+            html_parts.append(f"<li>Teams view truncated: <strong>{teams_truncated:,}</strong></li>")
+        if csv_truncated:
+            html_parts.append(f"<li>CSV capped by Genie: <strong>{csv_truncated:,}</strong></li>")
+        html_parts.append("</ul>")
+
+    if include_preview and rows and col_names:
+        # Full preview table (all rows since total ≤ preview_max)
+        thead = "".join(
+            f'<th style="border:1px solid #ddd;padding:6px;background:#f5f5f5;text-align:left">{esc(c)}</th>'
+            for c in col_names
+        )
+        body_rows = []
+        for r in rows[:preview_max]:
+            cells = []
+            for v, c in zip(r, schema):
+                cells.append(esc(fmt_cell(v, c.get("type_name"))))
+            tds = "".join(f'<td style="border:1px solid #ddd;padding:6px">{cell}</td>' for cell in cells)
+            body_rows.append(f"<tr>{tds}</tr>")
+        table_html = (
+            '<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #ddd;margin-top:8px">'
+            f"<thead><tr>{thead}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+        )
+        html_parts.append(table_html)
+    else:
+        html_parts.append(f'<p><em>Preview omitted due to size (&gt; {preview_max} rows). CSV attached.</em></p>')
+
+    html_body = "".join(html_parts)
+
+    return plain_body, html_body, include_preview
+
+# RE-ENABLE FOR EMAIL GRAPH SOLUTION
+def _oauth_authorize_url(state: str) -> str:
+    params = {
+        "client_id": MS_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": MS_REDIRECT_URI,
+        "response_mode": "query",
+        "scope": MS_SCOPES,
+        "state": state
+        # "prompt": "consent"
+    }
+    return f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/authorize?{urlencode(params)}"
+
+def _oauth_token_request(data: Dict[str, str]) -> Dict:
+    url = f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    r = requests.post(url, headers=headers, data=data, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def _now_epoch() -> int:
+    return int(time.time())
+
+def _save_tokens_for_user(user_id: str, tok: Dict):
+    GRAPH_TOKENS[user_id] = {
+        "access_token": tok["access_token"],
+        "refresh_token": tok.get("refresh_token", ""),
+        "expires_at": str(_now_epoch() + int(tok.get("expires_in", 3600) - 60)),
+    }
+
+def _get_valid_access_token(user_id: str) -> Optional[str]:
+    info = GRAPH_TOKENS.get(user_id)
+    if not info:
+        return None
+    if _now_epoch() < int(info.get("expires_at", "0")) and info.get("access_token"):
+        return info["access_token"]
+    if info.get("refresh_token"):
+        try:
+            tok = _oauth_token_request({
+                "client_id": MS_CLIENT_ID,
+                "scope": MS_SCOPES,
+                "refresh_token": info["refresh_token"],
+                "grant_type": "refresh_token",
+                "client_secret": MS_CLIENT_SECRET,
+                "redirect_uri": MS_REDIRECT_URI,
+            })
+            _save_tokens_for_user(user_id, tok)
+            return tok["access_token"]
+        except Exception:
+            logger.exception("Graph token refresh failed")
+    return None
+
+def create_draft_via_graph(access_token: str, subject: str, html_body: str) -> Dict:
+    url = "https://graph.microsoft.com/v1.0/me/messages"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    payload = {
+        "subject": subject,
+        "body": { "contentType": "HTML", "content": html_body },
+        "toRecipients": [], "ccRecipients": [], "bccRecipients": []
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def attach_csv_via_graph(access_token: str, message_id: str, csv_bytes: bytes, filename: str = "results.csv") -> Dict:
+    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/attachments"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    payload = {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": filename,
+        "contentType": "text/csv",
+        "contentBytes": base64.b64encode(csv_bytes).decode()
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+def format_sql_for_card(raw_sql: str) -> str:
+    """
+    Prettify SQL for display (IDE-like). Falls back to raw on any error.
+    """
+    try:
+        return sqlparse.format(
+            raw_sql or "",
+            reindent=True,
+            keyword_case="upper",     # UPPER keywords
+            identifier_case=None,     # keep identifiers as-is
+            strip_comments=False,     # keep comments
+            use_space_around_operators=True
+        ).strip()
+    except Exception:
+        return raw_sql or ""
+
+def escape_md_for_card(text: str) -> str:
+    """
+    Adaptive Card TextBlock parses a subset of Markdown. Escape chars that
+    often break SQL (underscore/pipe/asterisk/backtick).
+    """
+    return (
+        (text or "")
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+    )
+
+def chunk_text(s: str, limit: int = 2400):
+    """
+    Split long SQL into chunks so each TextBlock stays under card limits.
+    (Teams/Adaptive Cards can truncate overly long TextBlocks.)
+    """
+    s = s or ""
+    return [s[i:i+limit] for i in range(0, len(s), limit)]
 
 def build_sql_toggle_card(
     raw_sql: str,
     conversation_id: str,
-    truncated: bool
+    truncated: bool,
+    user_id: str
 ) -> Attachment:
-    # 1) base card
+    pretty_sql = format_sql_for_card(raw_sql)
+    safe_sql   = escape_md_for_card(pretty_sql)
+    chunks     = chunk_text(safe_sql, limit=2400)
+
+    # Base card
     card = {
       "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
       "type": "AdaptiveCard",
@@ -483,28 +867,37 @@ def build_sql_toggle_card(
           "id": "sqlContainer",
           "isVisible": False,
           "items": [
-            {"type": "TextBlock", "text": "**Generated SQL**", "weight": "Bolder"},
-            {"type": "TextBlock", "text": raw_sql, "wrap": True}
+            {"type": "TextBlock", "text": "**Generated SQL**", "weight": "Bolder"}
+          ] + [
+            {
+              "type": "TextBlock",
+              "text": chunk,
+              "wrap": True,
+              "fontType": "Monospace",     # ← IDE-like look
+              "spacing": "Small"
+            } for chunk in chunks
           ]
         }
       ],
-      # start with just the Show SQL button
       "actions": [
         {
-            "type": "Action.ToggleVisibility",
-            "title": "Show SQL",
-            "targetElements": ["sqlContainer"]
+          "type": "Action.ToggleVisibility",
+          "title": "Show SQL",
+          "targetElements": ["sqlContainer"]
         },
-
         {
-            "type":  "Action.OpenUrl",
-            "title": "Show Chart",
-            "url":   f"{DASH_URL}/chart?session={conversation_id}"
+          "type":  "Action.OpenUrl",
+          "title": "Show Chart",
+          "url":   f"{DASH_URL}/chart?session={conversation_id}"
+        },
+        {
+          "type":  "Action.OpenUrl",
+          "title": "Email Results",
+          "url":   f"{BOT_URL}/graph/login?session={conversation_id}&user={user_id}"
         }
       ]
     }
 
-    # 2) conditionally add the Download CSV button
     if truncated:
         card["actions"].append({
           "type":  "Action.OpenUrl",
@@ -512,7 +905,6 @@ def build_sql_toggle_card(
           "url":   f"{BOT_URL}/download_csv?session={conversation_id}"
         })
 
-    # 3) wrap and return
     return Attachment(
       content_type="application/vnd.microsoft.card.adaptive",
       content=card
@@ -521,6 +913,14 @@ def build_sql_toggle_card(
 def process_query_results(answer_json: Dict) -> str:
     sections: List[str] = []
     logger.info(f"Processing answer JSON: {answer_json}")
+
+    # 0) Plain-text summaries (e.g., "explain this dataset") come back as `message`
+    msg = answer_json.get("message")
+    if isinstance(msg, str) and msg.strip():
+        # Keep it simple and safe; Teams supports basic markdown.
+        sections.append("## Dataset Summary\n\n" + msg.strip() + "\n")
+        # Stitch and return immediately; there’s no table to render.
+        return "\n".join(sections)
 
     # 1) Metadata (row_count, execution_time_ms)
     meta = answer_json.get("query_result_metadata", {})
@@ -598,7 +998,7 @@ def process_query_results(answer_json: Dict) -> str:
     # 5) If nothing at all…
     if not sections:
         logger.error("No data available to show in process_query_results")
-        return "No data available.\n\n"
+        return "_No tabular results for this request._\n"
 
     # stitch and return
     return "\n".join(sections)
@@ -614,21 +1014,25 @@ class MyBot(ActivityHandler):
         self.conversation_ids: Dict[str, str] = {}
         self.user_state: Dict[str, Dict] = {}
 
+    async def _typing_pump(self, turn_context: TurnContext, interval: float = TYPING_INTERVAL):
+        """
+        Periodically send a 'typing' activity until cancelled.
+        """
+        while True:
+            try:
+                await turn_context.send_activity(Activity(type=ActivityTypes.typing))
+            except Exception:
+                logger.exception("Typing pump failed to send typing activity")
+            await asyncio.sleep(interval)
+
     async def on_message_activity(self, turn_context: TurnContext):
         user_id = turn_context.activity.from_property.id
-        # await turn_context.send_activity(MessageFactory.text("Processing request…"))
 
         state = self.user_state.setdefault(user_id, {})
-        # await turn_context.send_activity(Activity(type=ActivityTypes.typing))
-        
-        # if not state.get("did_ack"):
-        #     state["did_ack"] = True
-        #     # visible acknowledgement
-        #     await turn_context.send_activity(MessageFactory.text("Processing request…"))
 
         question = turn_context.activity.text
 
-        await turn_context.send_activity(Activity(type=ActivityTypes.typing))
+        typing_task = asyncio.create_task(self._typing_pump(turn_context, interval=TYPING_INTERVAL))
 
         try:
             # 1) call Genie
@@ -649,17 +1053,15 @@ class MyBot(ActivityHandler):
 
             await turn_context.send_activity(plain_markdown)
 
-            
-
-            # 3b) send only the SQL toggle card
-            raw_sql = answer_json.get("raw_sql", "")
-            conversation  = self.conversation_ids[user_id]
-            truncated     = answer_json.get("truncated", False)
-
-            sql_card = build_sql_toggle_card(raw_sql, conversation, truncated)
-            await turn_context.send_activity(
-                MessageFactory.attachment(sql_card)
-            )
+            # 3b) Send the SQL toggle card only if we actually have SQL
+            raw_sql = answer_json.get("raw_sql", "") or ""
+            if raw_sql.strip():
+                conversation  = self.conversation_ids[user_id]
+                truncated     = answer_json.get("truncated", False)
+                # If your build_sql_toggle_card now expects user_id too, pass it
+                # sql_card = build_sql_toggle_card(raw_sql, conversation, truncated, user_id)
+                sql_card = build_sql_toggle_card(raw_sql, conversation, truncated, user_id)
+                await turn_context.send_activity(MessageFactory.attachment(sql_card))
 
         except json.JSONDecodeError as jde:
             logger.exception("Failed to parse JSON from Genie")
@@ -674,6 +1076,10 @@ class MyBot(ActivityHandler):
                 "❗️ I’m sorry—I ran into an unexpected error processing your request. "
                 "Please try again in a moment."
             )
+        finally:
+            typing_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await typing_task
 
     async def on_members_added_activity(self, members_added: List[ChannelAccount], turn_context: TurnContext):
         for member in members_added:
@@ -681,6 +1087,199 @@ class MyBot(ActivityHandler):
                 await turn_context.send_activity("Welcome to the Supply Chain KNOWLEDGE Agent!")
 
 BOT = MyBot()
+
+async def _create_draft_for_session(user_id: str, session: str) -> web.Response:
+    access_token = _get_valid_access_token(user_id)
+    if not access_token:
+        return web.Response(status=401, text="No cached token; interactive sign-in required.")
+
+    data = SESSION_DATA.get(session)
+    if not data:
+        return web.Response(status=404, text="No session data to summarize.")
+
+    # ---- idempotency key for this user+session
+    key = f"{user_id}:{session}"
+    now = time.time()
+    cached = DRAFTS_BY_KEY.get(key)
+    if cached and (now - cached.get("ts", 0) <= DRAFT_CACHE_TTL):
+        logger.info("Reusing recent draft for %s", key)
+        web_link = cached["web_link"]
+        html = f"""<!doctype html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:Segoe UI, Arial; margin:16px">
+  <h3>Draft created</h3>
+  <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
+  <p>You can also find it in your Drafts folder in desktop Outlook.</p>
+</body></html>"""
+        return web.Response(text=html, content_type="text/html")
+
+    # Ensure only one creator runs for this key at a time
+    lock = _get_draft_lock(key)
+    async with lock:
+        # Double-check inside the lock (another request may have created it)
+        cached = DRAFTS_BY_KEY.get(key)
+        if cached and (time.time() - cached.get("ts", 0) <= DRAFT_CACHE_TTL):
+            logger.info("Reusing recent draft for %s (post-lock)", key)
+            web_link = cached["web_link"]
+            html = f"""<!doctype html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:Segoe UI, Arial; margin:16px">
+  <h3>Draft created</h3>
+  <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
+  <p>You can also find it in your Drafts folder in desktop Outlook.</p>
+</body></html>"""
+            return web.Response(text=html, content_type="text/html")
+
+                # ----- Supervisor (LLM) -----
+        try:
+            sup = supervisor_summarize(data)  # {'subject','summary_html','summary_text'}
+            subject_override = (sup.get("subject") or "").strip()
+            summary_html = (sup.get("summary_html") or "").strip()
+            summary_text = (sup.get("summary_text") or "").strip()
+        except Exception:
+            logger.exception("Supervisor failed; proceeding without overrides.")
+            subject_override = ""
+            summary_html = ""
+            summary_text = ""
+
+        # ----- Build bodies (use 50-row rule) -----
+        # Preview inline if TOTAL rows <= 50; otherwise no preview + attach CSV
+        plain_body, html_body, included_preview = build_email_bodies(data, preview_max=PREVIEW_MAX_ROWS)
+
+        # Subject: supervisor override if present; else your existing deterministic subject
+        subject = subject_override or build_business_subject(data)
+
+        # Inject executive summary ONLY if supervisor provided it (LLM enabled and succeeded)
+        if summary_html:
+            html_body = (
+                '<h2 style="margin:0 0 12px 0;">Executive Summary</h2>'
+                f'{summary_html}'
+            )
+        else:
+            # deterministic version
+            html_body = html_body
+
+        # Plain text body: if LLM summary exists, use only that; else fallback
+        if summary_text:
+            plain_body = (
+                "Executive Summary\n\n"
+                f"{summary_text}\n"
+            )
+        else:
+            plain_body = plain_body
+
+        if summary_text:
+            plain_body = (
+                "Executive Summary\n\n"
+                f"{summary_text}\n"
+                + ("-" * 24) + "\n"
+            ) + plain_body
+
+        # ----- Create draft + optional CSV attachment (unchanged) -----
+        try:
+            draft = create_draft_via_graph(access_token, subject, html_body)
+            msg_id   = draft.get("id")
+            web_link = draft.get("webLink")
+
+            if not included_preview:
+                csv_path = SESSION_FILES.get(session)
+                if csv_path and os.path.exists(csv_path):
+                    with open(csv_path, "rb") as f:
+                        csv_bytes = f.read()
+                    _ = attach_csv_via_graph(access_token, msg_id, csv_bytes, os.path.basename(csv_path))
+                else:
+                    logger.warning("CSV path missing for session %s; skipping attachment", session)
+
+            DRAFTS_BY_KEY[key] = {"msg_id": msg_id, "web_link": web_link, "ts": time.time()}
+
+        # # Build subject + bodies; attach CSV only when preview omitted
+        # plain_body, html_body, included_preview = build_email_bodies(data)
+        # subject = build_business_subject(data)
+
+        # try:
+        #     draft = create_draft_via_graph(access_token, subject, html_body)
+        #     msg_id   = draft.get("id")
+        #     web_link = draft.get("webLink")
+
+        #     if not included_preview:
+        #         csv_path = SESSION_FILES.get(session)
+        #         if csv_path and os.path.exists(csv_path):
+        #             with open(csv_path, "rb") as f:
+        #                 csv_bytes = f.read()
+        #             _ = attach_csv_via_graph(access_token, msg_id, csv_bytes, os.path.basename(csv_path))
+        #         else:
+        #             logger.warning("CSV path missing for session %s; skipping attachment", session)
+
+        #     # Cache the result to prevent duplicate drafts for a short window
+        #     DRAFTS_BY_KEY[key] = {"msg_id": msg_id, "web_link": web_link, "ts": time.time()}
+
+        except Exception:
+            logger.exception("Failed to create draft or attach CSV via Graph")
+            return web.Response(status=500, text="Failed to create Outlook draft.")
+
+    # Success page
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:Segoe UI, Arial; margin:16px">
+  <h3>Draft created</h3>
+  <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
+  <p>You can also find it in your Drafts folder in desktop Outlook.</p>
+</body></html>"""
+    return web.Response(text=html, content_type="text/html")
+
+# Prefer cached token; otherwise interactive login
+async def graph_login(request: web.Request) -> web.Response:
+    session = request.query.get("session") or ""
+    user_id = request.query.get("user") or ""
+    if not session or not user_id:
+        return web.Response(status=400, text="Missing session or user.")
+    if _get_valid_access_token(user_id):
+        raise web.HTTPFound(f"{BOT_URL}/graph/draft?session={session}&user={user_id}")
+    state = json.dumps({"session": session, "user": user_id})
+    raise web.HTTPFound(_oauth_authorize_url(state))
+
+app.router.add_get("/graph/login", graph_login)
+
+# Silent path using cached token
+async def graph_draft(request: web.Request) -> web.Response:
+    session = request.query.get("session") or ""
+    user_id = request.query.get("user") or ""
+    if not session or not user_id:
+        return web.Response(status=400, text="Missing session or user.")
+    return await _create_draft_for_session(user_id, session)
+
+app.router.add_get("/graph/draft", graph_draft)
+
+# After AAD callback, cache tokens then delegate to helper
+async def graph_callback(request: web.Request) -> web.Response:
+    code  = request.query.get("code")
+    state = request.query.get("state")
+    if not code or not state:
+        return web.Response(status=400, text="Missing code or state.")
+    try:
+        s = json.loads(state)
+        session = s["session"]
+        user_id = s["user"]
+    except Exception:
+        return web.Response(status=400, text="Invalid state")
+
+    try:
+        tok = _oauth_token_request({
+            "client_id": MS_CLIENT_ID,
+            "scope": MS_SCOPES,
+            "code": code,
+            "grant_type": "authorization_code",
+            "client_secret": MS_CLIENT_SECRET,
+            "redirect_uri": MS_REDIRECT_URI,
+        })
+        _save_tokens_for_user(user_id, tok)
+    except Exception:
+        logger.exception("Token exchange failed")
+        return web.Response(status=500, text="Failed to sign in to Microsoft Graph.")
+
+    return await _create_draft_for_session(user_id, session)
+
+app.router.add_get("/graph/callback", graph_callback)
 
 async def messages(req: web.Request) -> web.Response:
     if "application/json" in req.headers["Content-Type"]:
