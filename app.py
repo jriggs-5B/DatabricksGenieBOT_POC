@@ -96,55 +96,44 @@ GENIE_INSTRUCTIONS_ENABLED = os.getenv("GENIE_INSTRUCTIONS_ENABLED", "1") == "1"
 
 GENIE_INSTRUCTIONS = """\
 INSTRUCTIONS (SQL Authoring Rules)
-- Always use ILIKE (never LIKE).
-- Never use SELECT *.
+- When comparing string values, use ILIKE.
+- Always use ILIKE instead of LIKE.
+- Never use SELECT * in SQL queries.
 - For counts, use DISTINCT counts unless explicitly told otherwise.
-- Never show more than 20 columns in the result.
-- Fiscal year starts in February.
+- For weekly views, use the Retail Fiscal Calendar (fiscal year starts in February).
 
 Business Semantics & Definitions
-- "Order" = purchase order.
-- Order due date to DC = PO_ANTICIPATE_DT.
-- Cargo ready delay when Target_Cargo_Ready_DT < Latest_Vendor_Cargo_Ready_DT;
+- Cargo ready delay occurs when Target_Cargo_Ready_DT < Latest_Vendor_Cargo_Ready_DT;
   delay = Latest_Vendor_Cargo_Ready_DT - Target_Cargo_Ready_DT.
-- Delay to ship center/DC compares PO_ANTICIPATE_DT to SUGGESTED_NEW_ANTICIPATE_DT;
-  delay = SUGGESTED_NEW_ANTICIPATE_DT - PO_ANTICIPATE_DT and must be non-negative.
-- Domestic orders: FOB_TYPE_CD IN ('DOMESTIC PREPAID','DOMESTIC COLLECT').
-- Import orders: FOB_TYPE_CD = 'IMPORT'.
-- Bookings are due when booked_dt IS NULL and current_date > REQUEST_DT + 21 days.
+- Delay to ship center/DC is calculated by comparing PO_ANTICIPATE_DT with SUGGESTED_NEW_ANTICIPATE_DT;
+  delay = SUGGESTED_NEW_ANTICIPATE_DT - PO_ANTICIPATE_DT and delay must be non-negative.
+- Bookings are due when booked_dt IS NULL (or blank) AND current_date > REQUEST_DT + 21 days.
 - Orders are past due to ship if REQUEST_DT > current_date.
-- Import orders departed late if Actual departed date > (PO ship date + 7 days).
-- Container is unassigned if container_no IS NULL or blank.
-- Set is determined by PRIORITY_CD.
-- Container on-time if max(SUGGESTED_NEW_ANTICIPATE_DT) < min(PO_ANTICIPATE_DT); otherwise late.
-
-Column/Term Mappings
-- Ocean lane = Port of origin → Port of discharge.
-- DC = LOCATION_NO in inbound_po_supply_chain_20250721.
-- DC = DELIVERY_ADDRESS_TXT in inbound_otw_report_20250721.
-- Port of Discharge / Discharge Port = FIRST_DISCHARGE_NAME.
-
-Counting Rules
-- When counting containers, always COUNT(DISTINCT container_no).
+- Import orders are considered departed late from origin if Actual departed date > (PO ship date + 7 days).
+- A container is on-time if max(SUGGESTED_NEW_ANTICIPATE_DT) < min(PO_ANTICIPATE_DT); otherwise it is late.
+- For orders that have not arrived at the DC, use Balance Quantity for all questions about quantity/units.
 
 FEU / TEU Logic
 - FEU = forty-foot equivalent unit.
-- If booked_date IS NULL:   FEU = Ordered_Line_Volume / 61
-  Else:                      FEU = Booked_Line_Volume / 61
+- If booked_date IS NULL:   1 FEU = Ordered_Line_Volume / 61
+  Else:                      1 FEU = Booked_Line_Volume / 61
 
-Data Quality
-- Delay Reason code must NOT be blank if ETD is after PO ship date.
+Risk & Transit
+- Order is "at risk" if Risk Flag = 'Y'; otherwise it is not at risk.
+- Actual ocean transit time = Port ATA − ATD.
+- Expected ocean transit time: use Transit_Days_O_Ocean_and_Air.
+- For ocean transit lanes, Origin Port is the start; Discharge Port is the end.
 
 Lead Time & OTIF
-- Average lead time = ACTUAL_DC_ARRIVAL_DT - ORDER_DT.
-- OTIF = On-Time and In Full; an order is OTIF when received in full AND on time.
-- On time if ACTUAL_DC_ARRIVAL_DT <= PO_ANTICIPATE_DT.
-- In full if ORDERED_QTY <= RECEIVED_QTY.
+- Average lead time = ACTUAL_DC_ARRIVAL_DT − ORDER_DT.
+- OTIF = On-Time and In Full:
+  • On-time if ACTUAL_DC_ARRIVAL_DT <= PO_ANTICIPATE_DT
+  • In-full if ORDERED_QTY <= RECEIVED_QTY
 
 Dataset Routing
-- Containers/FEU/TEU/shipments → inbound_otw_report_20250721.
-- Orders → inbound_po_supply_chain_20250721.
-- Receipts / received orders → inbound_otw_report_20250721.
+- Containers / FEU / TEU / shipments → inbound_otw_report_20250721
+- Orders → inbound_po_supply_chain_20250721
+- Receipts / received orders → inbound_otw_report_20250721
 
 Apply all rules above when interpreting the request and generating SQL.
 """
