@@ -37,7 +37,7 @@ import base64
 from urllib.parse import urlencode, quote
 from contextlib import suppress
 import sqlparse
-from supervisor import supervisor_summarize
+from supervisor import supervisor_summarize, supervisor_insights
 
 # Log for prod
 # logging.basicConfig(level=logging.INFO)
@@ -89,6 +89,7 @@ PREVIEW_MAX_ROWS = 50
 TYPING_INTERVAL = 4.0
 DRAFT_CACHE_TTL = 120  # seconds to treat a draft as 'recent'
 DRAFTS_BY_KEY: dict[str, dict] = {}
+LLM_SUPERVISOR_INSIGHTS_ENABLED = os.getenv("LLM_SUPERVISOR_INSIGHTS_ENABLED", "0") == "1"
 
 # ---- Genie per-turn instructions (applied on every message) -----------------
 # Toggle with GENIE_INSTRUCTIONS_ENABLED=1 to enable; leave unset/0 to disable.
@@ -976,6 +977,12 @@ def process_query_results(answer_json: Dict) -> str:
             results_block += truncation_notice + "\n\n"
         results_block += "\n".join(table) + "\n"
         sections.append(results_block)
+
+                # --- NEW: Supervisor Insights ---
+        if LLM_SUPERVISOR_INSIGHTS_ENABLED:
+            insights = supervisor_insights(answer_json)
+            if insights.get("insights_text"):
+                sections.append("## Insights\n\n" + insights["insights_text"] + "\n")
     else:
         logger.debug("No results table to render")
 

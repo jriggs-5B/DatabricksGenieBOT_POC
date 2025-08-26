@@ -237,3 +237,65 @@ def supervisor_summarize(answer_json: Dict[str, Any]) -> Dict[str, str]:
     except Exception as e:
         logger.exception("LLM supervisor failed; using no-op overrides. Error: %s", e)
         return _empty_overrides()
+    
+
+def supervisor_insights(answer_json: dict) -> dict:
+    """
+    Generate business insights from Genie results.
+    Accepts the full answer_json for flexibility.
+    Returns { "insights_html": str, "insights_text": str }
+    """
+    try:
+        # Try the "direct" fields first (if process_query_results or other code sets them)
+        data_sample = answer_json.get("data_array")
+        schema = answer_json.get("schema")
+
+        # Otherwise drill into the Genie shape
+        if not data_sample:
+            data_sample = (
+                answer_json.get("statement_response", {})
+                .get("result", {})
+                .get("data_array", [])
+            )
+        if not schema:
+            schema = (
+                answer_json.get("statement_response", {})
+                .get("manifest", {})
+                .get("schema", {})
+                .get("columns", [])
+            )
+
+        if not data_sample or not schema:
+            return {"insights_html": "", "insights_text": ""}
+
+        prompt = f"""
+You are a retail supply chain analyst.
+Generate 2–4 concise insights based ONLY on the tabular data provided.
+
+Data schema: {schema}
+Data sample (first 20 rows max): {data_sample[:20]}
+
+Guidelines:
+- Bullet points
+- Business-friendly, plain English
+- No hallucinations, only use values present
+- No PII
+"""
+        resp = _client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": "You generate business insights for retail supply chain data."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=250,
+        )
+
+        text_out = resp.choices[0].message.content.strip()
+        html_out = "<ul>" + "".join(
+            [f"<li>{line.strip()}</li>" for line in text_out.split("\n") if line.strip()]
+        ) + "</ul>"
+
+        return {"insights_html": html_out, "insights_text": text_out}
+
+    except Exception as e:
+        return {"insights_html": "", "insights_text": f"[Supervisor error: {e}]"}
