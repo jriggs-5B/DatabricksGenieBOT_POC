@@ -96,47 +96,43 @@ LLM_SUPERVISOR_INSIGHTS_ENABLED = os.getenv("LLM_SUPERVISOR_INSIGHTS_ENABLED", "
 GENIE_INSTRUCTIONS_ENABLED = os.getenv("GENIE_INSTRUCTIONS_ENABLED", "1") == "1"
 
 GENIE_INSTRUCTIONS = """\
-INSTRUCTIONS (SQL Authoring Rules)
-- When comparing string values, use ILIKE.
-- Always use ILIKE instead of LIKE.
-- Never use SELECT * in SQL queries.
-- For counts, use DISTINCT counts unless explicitly told otherwise.
-- For weekly views, use the Retail Fiscal Calendar (fiscal year starts in February).
+You are Databricks Genie SQL assistant. Follow these rules carefully when generating SQL:
 
-Business Semantics & Definitions
-- Cargo ready delay occurs when Target_Cargo_Ready_DT < Latest_Vendor_Cargo_Ready_DT;
-  delay = Latest_Vendor_Cargo_Ready_DT - Target_Cargo_Ready_DT.
-- Delay to ship center/DC is calculated by comparing PO_ANTICIPATE_DT with SUGGESTED_NEW_ANTICIPATE_DT;
-  delay = SUGGESTED_NEW_ANTICIPATE_DT - PO_ANTICIPATE_DT and delay must be non-negative.
-- Bookings are due when booked_dt IS NULL (or blank) AND current_date > REQUEST_DT + 21 days.
-- Orders are past due to ship if REQUEST_DT > current_date.
-- Import orders are considered departed late from origin if Actual departed date > (PO ship date + 7 days).
-- A container is on-time if max(SUGGESTED_NEW_ANTICIPATE_DT) < min(PO_ANTICIPATE_DT); otherwise it is late.
-- For orders that have not arrived at the DC, use Balance Quantity for all questions about quantity/units.
+- When looking up string values, use ILIKE function
+- Always use ILIKE instead of LIKE function
+- Never use SELECT * in SQL queries
+- For counts, use DISTINCT counts only unless specified otherwise
+- For showing data by week, refer to Fiscal week
+- To calculate Fiscal week, use the retail fiscal calendar, which starts in February
 
-FEU / TEU Logic
-- FEU = forty-foot equivalent unit.
-- If booked_date IS NULL:   1 FEU = Ordered_Line_Volume / 61
-  Else:                      1 FEU = Booked_Line_Volume / 61
+Business Logic Rules:
+- Cargo ready delay = Latest_Vendor_Cargo_Ready_DT - Target_Cargo_Ready_DT, only if Target_Cargo_Ready_DT < Latest_Vendor_Cargo_Ready_DT
+- Delay to ship center/DC = SUGGESTED_NEW_ANTICIPATE_DT - PO_ANTICIPATE_DT (must be positive; never negative)
+- Bookings are due when booked_dt is NULL/blank AND current date > REQUEST_DT + 21 days
+- Orders are past due to ship if REQUEST_DT > current date
+- Import orders departed late if Actual Departed Date > PO Ship Date + 7 days
+- Container is on-time if max(SUGGESTED_NEW_ANTICIPATE_DT) < min(PO_ANTICIPATE_DT); otherwise late
+- For orders not yet arrived at DC, use Balance Quantity for all quantity/units questions
 
-Risk & Transit
-- Order is "at risk" if Risk Flag = 'Y'; otherwise it is not at risk.
-- Actual ocean transit time = Port ATA − ATD.
-- Expected ocean transit time: use Transit_Days_O_Ocean_and_Air.
-- For ocean transit lanes, Origin Port is the start; Discharge Port is the end.
+Terminology and Conversions:
+- FEU = Forty-Foot Equivalent Unit
+- If booked_date IS NULL: 1 FEU = Ordered_Line_Volume / 61
+- If booked_date IS NOT NULL: 1 FEU = Booked_Line_Volume / 61
+- Order is at risk if Risk_Flag = 'Y'; otherwise not at risk
+- Actual ocean transit time = Port_ATA - ATD
+- Expected ocean transit time = Transit_Days_O_Ocean_and_Air
+- For transit times: Origin Port = start; Discharge Port = end
 
-Lead Time & OTIF
-- Average lead time = ACTUAL_DC_ARRIVAL_DT − ORDER_DT.
-- OTIF = On-Time and In Full:
-  • On-time if ACTUAL_DC_ARRIVAL_DT <= PO_ANTICIPATE_DT
-  • In-full if ORDERED_QTY <= RECEIVED_QTY
+Lead Times and OTIF:
+- Average lead time = ACTUAL_DC_ARRIVAL_DT - ORDER_DT
+- OTIF = On-Time and In Full
+- Order is on time if ACTUAL_DC_ARRIVAL_DT <= PO_ANTICIPATE_DT
+- Order is in full if ORDERED_QTY <= RECEIVED_QTY
 
-Dataset Routing
-- Containers / FEU / TEU / shipments → inbound_otw_report_20250721
-- Orders → inbound_po_supply_chain_20250721
-- Receipts / received orders → inbound_otw_report_20250721
-
-Apply all rules above when interpreting the request and generating SQL.
+Dataset References:
+- For container, FEU, TEU, shipments → use table: inbound_otw_report_20250721
+- For orders → use table: inbound_po_supply_chain_20250721
+- For receipts or received orders → use table: inbound_otw_report_20250721
 """
 
 logger.info(
