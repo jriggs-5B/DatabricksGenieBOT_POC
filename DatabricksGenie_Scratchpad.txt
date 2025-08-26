@@ -18,10 +18,14 @@ Databricks Tables w/ no supervisor agent - email button added
 container = 
 docker.io/jaspersj/poc-genie-web-app:DEV-email
 
-CURRENT DEV DEPLOYMENT SLOT
-Databricks Tables w/ no supervisor agent - email summary and subject using AI
+Databricks Tables w/ supervisor agent email feature [STABLE BUILD]
 container = 
 docker.io/jaspersj/poc-genie-web-app:DEV-email_ai
+
+CURRENT DEV DEPLOYMENT SLOT
+Databricks Tables w/ supervisor agent - insights added to teams
+container = 
+docker.io/jaspersj/poc-genie-web-app:DEV-insights
 
 CURRENT PROD DEPLOYMENT SLOT
 Databricks Tables w/ supervisor agent email feature [STABLE BUILD]
@@ -54,14 +58,14 @@ az webapp config container set \
 
 az webapp restart \
 --resource-group RG-Know-Dev \
---name POC-genie-web-app \
+--name POC-genie-web-app
 
 Dev Deployment Slot
 
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -f Dockerfile \
-  -t jaspersj/poc-genie-web-app:DEV-email_ai \
+  -t jaspersj/poc-genie-web-app:DEV-insights \
   --push \
   .
 
@@ -69,7 +73,7 @@ az webapp config container set \
   --resource-group RG-Know-Dev \
   --name POC-genie-web-app \
   --slot dev \
-  --container-image-name jaspersj/poc-genie-web-app:DEV-email_ai \
+  --container-image-name jaspersj/poc-genie-web-app:DEV-insights \
   --container-registry-url https://index.docker.io
 
 az webapp restart \
