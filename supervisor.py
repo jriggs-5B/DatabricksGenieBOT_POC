@@ -269,18 +269,25 @@ def supervisor_insights(answer_json: dict) -> dict:
             return {"insights_html": "", "insights_text": ""}
 
         prompt = f"""
-You are a retail supply chain analyst.
-Generate 2–4 concise insights based ONLY on the tabular data provided.
+        You are an experienced retail supply chain analyst. Your audience is inventory planners, buyers, supply chain analysts, 
+        and merchandise operations analysts who use this tool to locate product in the supply chain and determine where there 
+        are potential issues.
 
-Data schema: {schema}
-Data sample (first 20 rows max): {data_sample[:20]}
+        Your task is to review the provided data and generate 2–4 concise, high-value insights that go beyond description:
+        - Identify potential supply chain risks, delays, shortages, or imbalances.
+        - Highlight notable contributors (e.g., top vendors, DCs, SKUs, origins) driving issues or concentration of volume.
+        - Suggest practical next steps, possible root causes, or follow-up questions to explore.
 
-Guidelines:
-- Bullet points
-- Business-friendly, plain English
-- No hallucinations, only use values present
-- No PII
-"""
+        Data schema: {schema}
+        Data sample (first 20 rows max): {data_sample[:20]}
+
+        Guidelines:
+        - Use bullet points.
+        - Business-friendly, plain English.
+        - Each point should either highlight a potential issue OR propose a potential action/question.
+        - Keep strictly grounded in the data provided (no assumptions or hallucinations).
+        - Do not include PII.
+        """
         resp = _client.chat.completions.create(
             model=LLM_MODEL,
             messages=[

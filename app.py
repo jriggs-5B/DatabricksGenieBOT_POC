@@ -38,6 +38,7 @@ from urllib.parse import urlencode, quote
 from contextlib import suppress
 import sqlparse
 from supervisor import supervisor_summarize, supervisor_insights
+from storage import save_user_profile
 
 # Log for prod
 # logging.basicConfig(level=logging.INFO)
@@ -82,7 +83,7 @@ MS_CLIENT_ID     = os.getenv("MicrosoftAppId", "")
 MS_CLIENT_SECRET = os.getenv("MicrosoftAppPassword", "")
 MS_TENANT_ID     = os.getenv("MS_TENANT_ID")  # or your tenant GUID
 MS_REDIRECT_URI  = os.getenv("MS_REDIRECT_URI")         # e.g. https://<bot-host>/graph/callback
-MS_SCOPES        = "openid profile offline_access Mail.ReadWrite"
+MS_SCOPES        = "openid profile offline_access Mail.ReadWrite User.Read.All"
 GRAPH_TOKENS: Dict[str, Dict[str, str]] = {}
 # OWA_MAX_URL_LEN = 1400  # keep the final URL comfortably below Safe Links limits
 PREVIEW_MAX_ROWS = 50
@@ -768,6 +769,25 @@ def _get_valid_access_token(user_id: str) -> Optional[str]:
             logger.exception("Graph token refresh failed")
     return None
 
+def get_graph_user_details(aad_id: str, token: str) -> dict:
+    """
+    Fetch full Graph user object using the user's AAD Object ID.
+    """
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"https://graph.microsoft.com/v1.0/users/{aad_id}"
+        resp = requests.get(url, headers=headers)
+        if resp.status_code == 200:
+            user_data = resp.json()
+            logger.info(f"Graph user lookup for {aad_id}: {user_data}")
+            return user_data
+        else:
+            logger.warning(f"Graph lookup failed for {aad_id}: {resp.text}")
+            return {}
+    except Exception:
+        logger.exception(f"Error calling Graph for {aad_id}")
+        return {}
+
 def create_draft_via_graph(access_token: str, subject: str, html_body: str) -> Dict:
     url = "https://graph.microsoft.com/v1.0/me/messages"
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
@@ -1037,6 +1057,32 @@ class MyBot(ActivityHandler):
 
             # 2) parse JSON
             answer_json = json.loads(answer)
+
+            # safely add user info without affecting Genie response
+            aad_id = getattr(turn_context.activity.from_property, "aad_object_id", None)
+            aad_name = turn_context.activity.from_property.name
+            answer_json["user_info"] = {
+                "id": turn_context.activity.from_property.id,
+                "name": aad_name,
+                "aad_id": aad_id,
+            }
+
+            token = _get_valid_access_token(user_id)
+            if not token:
+                logger.warning(f"No Graph token available for user_id={user_id} aad_id={aad_id}")
+            if token and aad_id:
+                graph_user = get_graph_user_details(aad_id, token)
+                answer_json["user_info"]["graph_raw"] = graph_user
+
+            logger.info(f"Captured user info: {answer_json['user_info']}")
+
+            # persist user profile + Graph enrichment into Table Storage
+            if aad_id and aad_name:
+                try:
+                    from storage import save_user_profile
+                    save_user_profile(aad_id, aad_name)
+                except Exception:
+                    logger.warning(f"Skipped saving user profile for {aad_id} until Application User.Read.All is granted")
 
             # 3a) send plain‑text markdown (description + results)
             plain_markdown = process_query_results(answer_json)
