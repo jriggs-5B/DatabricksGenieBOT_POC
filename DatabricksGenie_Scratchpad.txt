@@ -39,10 +39,14 @@ Databricks Tables w/ supervisor agent - insights and prefs merged for testing
 container = 
 docker.io/jaspersj/poc-genie-web-app:DEV-insights-prefs
 
-CURRENT PROD DEPLOYMENT SLOT
 Databricks Tables w/ supervisor agent email feature [STABLE BUILD]
 container = 
 docker.io/jaspersj/poc-genie-web-app:PROD
+
+CURRENT PROD DEPLOYMENT SLOT
+Databricks Tables w/ supervisor agent - insights and prefs
+container = 
+docker.io/jaspersj/poc-genie-web-app:PROD-Validate
 
 PROD HOST URL = https://poc-genie-web-app-hwerdjfpauehcxa4.eastus-01.azurewebsites.net
 DEV HOST URL = https://poc-genie-web-app-dev-gjh9c4hvhzc2aagx.eastus-01.azurewebsites.net
@@ -56,14 +60,14 @@ Main Deployment Slot
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -f Dockerfile \
-  -t jaspersj/poc-genie-web-app:PROD \
+  -t jaspersj/poc-genie-web-app:PROD-Validate \
   --push \
   .
 
 az webapp config container set \
 --resource-group RG-Know-Dev \
 --name POC-genie-web-app \
---container-image-name jaspersj/poc-genie-web-app:PROD \
+--container-image-name jaspersj/poc-genie-web-app:PROD=Validate \
 --container-registry-url https://index.docker.io
 
 az webapp restart \
