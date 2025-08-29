@@ -30,10 +30,14 @@ Databricks Tables w/ supervisor agent - insights added to teams
 container = 
 docker.io/jaspersj/poc-genie-web-app:DEV-insights-storage
 
-CURRENT DEV DEPLOYMENT SLOT
 Databricks Tables w/ supervisor agent - captures and stores user prefs
 container = 
 docker.io/jaspersj/poc-genie-web-app:DEV-stored-prefs
+
+CURRENT DEV DEPLOYMENT SLOT
+Databricks Tables w/ supervisor agent - insights and prefs merged for testing
+container = 
+docker.io/jaspersj/poc-genie-web-app:DEV-insights-prefs
 
 CURRENT PROD DEPLOYMENT SLOT
 Databricks Tables w/ supervisor agent email feature [STABLE BUILD]
@@ -71,7 +75,7 @@ Dev Deployment Slot
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -f Dockerfile \
-  -t jaspersj/poc-genie-web-app:DEV-stored-prefs \
+  -t jaspersj/poc-genie-web-app:DEV-insights-prefs \
   --push \
   .
 
@@ -79,7 +83,7 @@ az webapp config container set \
   --resource-group RG-Know-Dev \
   --name POC-genie-web-app \
   --slot dev \
-  --container-image-name jaspersj/poc-genie-web-app:DEV-stored-prefs \
+  --container-image-name jaspersj/poc-genie-web-app:DEV-insights-prefs \
   --container-registry-url https://index.docker.io
 
 az webapp restart \
