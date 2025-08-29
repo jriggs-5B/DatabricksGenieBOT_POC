@@ -29,8 +29,6 @@ from databricks.sdk.service.dashboards import GenieAPI, MessageStatus
 import asyncio
 import requests
 import re
-# from email.message import EmailMessage
-# from email.utils import formatdate
 import html
 # RE-ENABLE FOR EMAIL GRAPH SOLUTION
 import base64
@@ -38,28 +36,7 @@ from urllib.parse import urlencode, quote
 from contextlib import suppress
 import sqlparse
 from supervisor import supervisor_summarize, supervisor_insights
-from storage import save_user_profile
-
-# Log for prod
-# logging.basicConfig(level=logging.INFO)
-# logger = logging.getLogger(__name__)
-# logging.getLogger("databricks_genie").setLevel(logging.DEBUG)
-
-#Log for development
-# 1) Enable DEBUG everywhere (you can narrow this later)
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s"
-)
-
-# 2) Your module logger
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-# 3) Turn on the Databricks SDK + HTTP internals
-logging.getLogger("databricks").setLevel(logging.DEBUG)
-logging.getLogger("databricks.sdk").setLevel(logging.DEBUG)
-logging.getLogger("urllib3").setLevel(logging.DEBUG)
+from storage import save_user_profile, save_user_pref, get_user_prefs
 
 # Env vars
 load_dotenv()
@@ -91,6 +68,29 @@ TYPING_INTERVAL = 4.0
 DRAFT_CACHE_TTL = 120  # seconds to treat a draft as 'recent'
 DRAFTS_BY_KEY: dict[str, dict] = {}
 LLM_SUPERVISOR_INSIGHTS_ENABLED = os.getenv("LLM_SUPERVISOR_INSIGHTS_ENABLED", "0") == "1"
+EXPLICIT_INTENT = re.compile(
+    r"\b(remember|set|save|store|make\s+(?:it\s+)?(?:my\s+)?default|default\s+to|prefer|use)\b",
+    re.IGNORECASE,)
+VALID_DEPTS =   {"32", "41", "42", "44", "45", "46",
+                "51", "52", "53", "55", "61", "63",
+                "64", "66", "67", "82", "83", "84",
+                "85", "86", "91", "93", "95", "96"}
+VALID_DCS =     {"3", "4", "5", "6", "7"}
+VALID_REGIONS = {"FLORIDA", "GREAT LAKES", "MID ATLANTIC",
+                "MID SOUTH", "MIDWEST", "MOUNTAIN",
+                "NEW YORK CITY METRO", "NORTHEAST",
+                "SOUTH ATLANTIC", "SOUTHEAST", "SOUTHERN",
+                "TEXAS", "WEST"}
+
+# Configure root logger
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
+
+# Module-level logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 # ---- Genie per-turn instructions (applied on every message) -----------------
 # Toggle with GENIE_INSTRUCTIONS_ENABLED=1 to enable; leave unset/0 to disable.
@@ -136,10 +136,10 @@ Dataset References:
 - For receipts or received orders → use table: inbound_otw_report_20250721
 """
 
-logger.info(
-    "Graph config at startup: client_id=%r tenant=%r redirect=%r",
-    MS_CLIENT_ID, MS_TENANT_ID, MS_REDIRECT_URI
-)
+# logger.info(
+#     "Graph config at startup: client_id=%r tenant=%r redirect=%r",
+#     MS_CLIENT_ID, MS_TENANT_ID, MS_REDIRECT_URI
+# )
 
 workspace_client = WorkspaceClient(
     host=DATABRICKS_HOST,
@@ -154,34 +154,6 @@ app = web.Application()
 app.router.add_get("/healthz", healthz)
 
 genie_api = GenieAPI(workspace_client.api_client)
-
-async def diag_model(request):
-    import json
-    from openai import OpenAI
-    client = OpenAI()
-
-    model_to_test = "gpt-5-nano"
-    try:
-        resp = client.chat.completions.create(
-            model=model_to_test,
-            messages=[{"role":"user","content":"Ping"}],
-            max_completion_tokens=1,
-        )
-        return web.json_response({
-            "status": "ok",
-            "model": model_to_test,
-            "output": resp.choices[0].message.content or "<empty>"
-        })
-    except Exception as e:
-        return web.json_response({
-            "status": "error",
-            "model": model_to_test,
-            "error": str(e)
-        }, status=400)
-
-app.router.add_get("/diag/model", diag_model)
-
-
 
 def get_attachment_query_result(space_id, conversation_id, message_id, attachment_id):
     url = f"{DATABRICKS_HOST}/api/2.0/genie/spaces/{space_id}/conversations/{conversation_id}/messages/{message_id}"
@@ -336,18 +308,46 @@ def count_total_rows_via_sql_warehouse(raw_sql: str) -> Optional[int]:
 
     return None
 
-def _compose_genie_prompt(user_question: str) -> str:
+def _compose_genie_prompt(user_question: str, aad_id: str | None = None) -> str:
+    """
+    Build the full Genie prompt including base instructions,
+    user-specific preferences (if any), and the actual request.
+    """
     if not GENIE_INSTRUCTIONS_ENABLED:
         return user_question
-    # Keep it simple and deterministic (no markdown blocks needed).
-    return f"{GENIE_INSTRUCTIONS}\nREQUEST:\n{user_question}"
+
+    system_prompt = GENIE_INSTRUCTIONS
+
+    # Inject user preferences if available
+    if aad_id:
+        prefs = get_user_prefs(aad_id)
+        system_prompt = apply_user_prefs_to_prompt(system_prompt, prefs, user_question)
+
+        # ---- NEW: replace invalid mentions with valid prefs ----
+        for key, valid_values in prefs.items():
+            if key == "dept":
+                # remove any non-valid dept mentions
+                for v in re.findall(r"\b\d+\b", user_question):
+                    if v not in VALID_DEPTS:
+                        user_question = re.sub(rf"\b{re.escape(v)}\b", "", user_question)
+            elif key == "dc":
+                for v in re.findall(r"\b\d+\b", user_question):
+                    if v not in VALID_DCS:
+                        user_question = re.sub(rf"\b{re.escape(v)}\b", "", user_question)
+            elif key == "region":
+                for v in re.findall(r"\b\w+\b", user_question):
+                    if v.capitalize() not in VALID_REGIONS:
+                        user_question = re.sub(rf"\b{re.escape(v)}\b", "", user_question)
+
+    return f"{system_prompt}\nREQUEST:\n{user_question}"
 
 logger = logging.getLogger(__name__)
 
 async def ask_genie(
     question: str,
     space_id: str,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    aad_id: Optional[str] = None
 ) -> tuple[str, str]:
     logger.debug("🔥 ENTERING ask_genie v2! 🔥")
     logger.debug("🛠️  ASK_GENIE PAYLOAD HOTFIX DEPLOYED 🛠️")
@@ -358,7 +358,7 @@ async def ask_genie(
         # 1) start or continue conversation
         # ───────────────────────────────────────────────────────────────────────────
         # Compose prompt with per-turn instructions
-        composed_question = _compose_genie_prompt(question)
+        composed_question = _compose_genie_prompt(question, aad_id)
 
         if conversation_id is None:
             initial_message = await loop.run_in_executor(
@@ -769,6 +769,184 @@ def _get_valid_access_token(user_id: str) -> Optional[str]:
             logger.exception("Graph token refresh failed")
     return None
 
+KEY_NORMALIZATION = {
+    "department": "dept",
+    "departments": "dept",
+    "dept": "dept",
+    "depts": "dept",
+    "dc": "dc",
+    "distribution center": "dc",
+    "distribution centers": "dc",
+    "region": "region",
+    "regions": "region",
+}
+
+async def maybe_handle_pref_command(turn_context, aad_id: str, question: str) -> bool:
+    """
+    Handle explicit commands like 'remember my dept is 42'
+    or 'set dc 3 and 7'.
+    Returns True if handled, False otherwise.
+    """
+    text = question.lower()
+
+    CONNECTOR = r"(?:are|is|=|as|to|:)?"   # <-- add as|to|: here
+
+    patterns = {
+        # dept / departments …
+        "dept": re.compile(
+            rf"\b(?:dept|depts|department|departments)\s*{CONNECTOR}\s*([\d\s, and]+)",
+            re.IGNORECASE,
+        ),
+        # dc / dcs / distribution center(s)
+        "dc": re.compile(
+            rf"\b(?:dc|dcs|distribution\s+center(?:s)?)\s*{CONNECTOR}\s*([\d\s, and]+)",
+            re.IGNORECASE,
+        ),
+        # region(s) – words allowed
+        "region": re.compile(
+            rf"\bregion(?:s)?\s*{CONNECTOR}\s*([\w\s, and]+)",
+            re.IGNORECASE,
+        ),
+    }
+
+    for key, pattern in patterns.items():
+        match = pattern.search(question)
+        if match:
+            key = KEY_NORMALIZATION.get(key, key)
+            raw_value = match.group(1).strip()
+
+            # Split multiple values on commas or "and"
+            if key in ("dept", "dc"):
+                values = re.split(r"[,\sand]+", raw_value)
+                values = [v.strip() for v in values if v.strip().isdigit()]
+            else:  # region
+                values = [v.strip() for v in re.split(r"[,\sand]+", raw_value) if v.strip()]
+
+            if not values:
+                continue  # nothing valid parsed
+
+            # ---- VALIDATION ----
+            valid, invalid = validate_pref(key, values)
+            if not valid:
+                await turn_context.send_activity(
+                    f"⚠️ Sorry, I can’t save {key}={', '.join(invalid)}. "
+                    f"Valid values are: {', '.join(sorted(VALID_DCS if key=='dc' else VALID_DEPTS if key=='dept' else VALID_REGIONS))}."
+                )
+                return True  # handled; don’t call Genie
+
+            # Save list if multiple, single string if one
+            pref_value = values if len(valid) > 1 else valid[0]
+
+            prefs = save_user_pref(aad_id, key, pref_value)
+
+            # Build confirmation message
+            label = key
+            if isinstance(pref_value, list):
+                values_str = ", ".join(pref_value)
+                msg = f"✅ Got it — I’ll remember your default {label}s = [{values_str}]."
+            else:
+                msg = f"✅ Got it — I’ll remember your default {label} = {pref_value}."
+
+            if invalid:
+                msg = f"⚠️ Ignoring invalid {key}(s): {', '.join(invalid)}. " + msg
+
+            await turn_context.send_activity(f"{msg} (Current prefs: {prefs})")
+            return True
+
+    return False
+
+def extract_depts(question: str) -> list[str]:
+    import re, logging
+    logger = logging.getLogger(__name__)
+
+    matches = re.findall(r"\b(?:dept|depts|department|departments)\s*(?:=)?\s*(\d+)", question, re.I)
+    logger.info(f"extract_depts: regex direct matches = {matches}")
+
+    if not matches:
+        combo = re.search(r"\b(?:dept|depts|department|departments)\s*(.+)", question, re.I)
+        if combo:
+            logger.info(f"extract_depts: fallback combo = {combo.group(1)}")
+            vals = re.split(r"[,\s]+and\s+|,|\s+and\s+", combo.group(1))
+            cleaned = [v.strip() for v in vals if v.strip().isdigit()]
+            logger.info(f"extract_depts: cleaned fallback = {cleaned}")
+            return cleaned
+
+    return matches
+
+def extract_dcs(question: str) -> list[str]:
+    # Match "dc7", "dc 7", "distribution center 4, 5"
+    matches = re.findall(r"\b(?:dc|distribution center)\s*(\d+)", question, re.I)
+    return matches
+
+def extract_regions(question: str) -> list[str]:
+    # Match "region east", "region=west", "regional sales for north and south"
+    matches = re.findall(r"\bregion(?:al)?\s*(?:=)?\s*([a-zA-Z]+)", question, re.I)
+    return [m.capitalize() for m in matches]
+
+def validate_pref(key: str, values: list[str]) -> tuple[list[str], list[str]]:
+    """
+    Returns (valid, invalid) lists for given key/values.
+    """
+    if key == "dept":
+        valid = [v for v in values if v in VALID_DEPTS]
+    elif key == "dc":
+        valid = [v for v in values if v in VALID_DCS]
+    elif key == "region":
+        valid = [v.capitalize() for v in values if v.capitalize() in VALID_REGIONS]
+    else:
+        return [], values
+    invalid = [v for v in values if v not in valid]
+    return valid, invalid
+
+def apply_user_prefs_to_prompt(system_prompt: str, prefs: dict, question: str) -> str:
+    # --- Dept ---
+    q_depts = extract_depts(question)
+    if q_depts:
+        valid, invalid = validate_pref("dept", q_depts)
+        if valid:
+            system_prompt += f"\nAlways filter by dept IN ({', '.join(valid)}) unless user specifies otherwise."
+        else:
+            logger.warning(f"User specified invalid dept(s): {q_depts}")
+            # keep question as-is; do not override with prefs
+    elif "dept" in prefs:
+        val = prefs["dept"]
+        if isinstance(val, list):
+            system_prompt += f"\nAlways filter by dept IN ({', '.join(val)}) unless user specifies otherwise."
+        else:
+            system_prompt += f"\nAlways filter by dept={val} unless user specifies otherwise."
+
+    # --- DC ---
+    q_dcs = extract_dcs(question)
+    if q_dcs:
+        valid, invalid = validate_pref("dc", q_dcs)
+        if valid:
+            system_prompt += f"\nAlways filter by DC IN ({', '.join(valid)}) unless user specifies otherwise."
+        else:
+            logger.warning(f"User specified invalid DC(s): {q_dcs}")
+    elif "dc" in prefs:
+        val = prefs["dc"]
+        if isinstance(val, list):
+            system_prompt += f"\nAlways filter by DC IN ({', '.join(val)}) unless user specifies otherwise."
+        else:
+            system_prompt += f"\nAlways filter by DC={val} unless user specifies otherwise."
+
+    # --- Region ---
+    q_regions = extract_regions(question)
+    if q_regions:
+        valid, invalid = validate_pref("region", q_regions)
+        if valid:
+            system_prompt += f"\nAlways filter by region IN ({', '.join(valid)}) unless user specifies otherwise."
+        else:
+            logger.warning(f"User specified invalid region(s): {q_regions}")
+    elif "region" in prefs:
+        val = prefs["region"]
+        if isinstance(val, list):
+            system_prompt += f"\nAlways filter by region IN ({', '.join(val)}) unless user specifies otherwise."
+        else:
+            system_prompt += f"\nAlways filter by region={val} unless user specifies otherwise."
+
+    return system_prompt
+
 def get_graph_user_details(aad_id: str, token: str) -> dict:
     """
     Fetch full Graph user object using the user's AAD Object ID.
@@ -779,7 +957,7 @@ def get_graph_user_details(aad_id: str, token: str) -> dict:
         resp = requests.get(url, headers=headers)
         if resp.status_code == 200:
             user_data = resp.json()
-            logger.info(f"Graph user lookup for {aad_id}: {user_data}")
+            logger.debug(f"Graph user lookup for {aad_id}: displayName={user_data.get('displayName')} mail={user_data.get('mail')}")
             return user_data
         else:
             logger.warning(f"Graph lookup failed for {aad_id}: {resp.text}")
@@ -1038,11 +1216,54 @@ class MyBot(ActivityHandler):
             await asyncio.sleep(interval)
 
     async def on_message_activity(self, turn_context: TurnContext):
-        user_id = turn_context.activity.from_property.id
+        from_prop = turn_context.activity.from_property
+        user_id   = getattr(from_prop, "id", None)                      # BF channel id
+        aad_id    = getattr(from_prop, "aad_object_id", None)           # Entra object id
+        aad_name  = getattr(from_prop, "name", None) or "Unknown"       # display name fallback
+
+        try:
+            from storage import save_user_profile
+            logger.info(f"[USER] upserting UserPrefs for aad_id={aad_id} name={aad_name!r}")
+            save_user_profile(aad_id, aad_name)
+            logger.info("[USER] save_user_profile completed")
+        except Exception:
+            logger.exception(f"[USER] save_user_profile failed (aad_id={aad_id})")
 
         state = self.user_state.setdefault(user_id, {})
 
         question = turn_context.activity.text
+
+        pending = state.get("pending_pref")
+        if pending:
+            lower_q = question.strip().lower()
+            if lower_q in ("yes", "y", "ok", "sure"):
+                # normalize key
+                key = KEY_NORMALIZATION.get(pending["key"].lower(), pending["key"])
+
+                save_user_pref(aad_id, key, pending["value"])
+
+                vals = pending["value"]
+                if isinstance(vals, list):
+                    pretty_vals = ", ".join(vals)
+                else:
+                    pretty_vals = str(vals)
+
+                await turn_context.send_activity(
+                    f"✅ Got it — I’ll remember your {key}(s): {pretty_vals}."
+                )
+                state.pop("pending_pref", None)
+                return
+
+            elif lower_q in ("no", "n", "nope", "nah", "not now", "cancel", "stop"):
+                await turn_context.send_activity(
+                    f"👍 Okay — I won’t save that {pending['key']}."
+                )
+                state.pop("pending_pref", None)
+                return
+
+        if EXPLICIT_INTENT.search(question):
+            if await maybe_handle_pref_command(turn_context, aad_id, question):
+                return  # handled; skip Genie for this turn
 
         typing_task = asyncio.create_task(self._typing_pump(turn_context, interval=TYPING_INTERVAL))
 
@@ -1052,11 +1273,92 @@ class MyBot(ActivityHandler):
                 question,
                 DATABRICKS_SPACE_ID,
                 self.conversation_ids.get(user_id),
+                aad_id=aad_id,
             )
             self.conversation_ids[user_id] = new_conversation_id
 
             # 2) parse JSON
             answer_json = json.loads(answer)
+
+            # map of preference keys to the trigger words we’ll look for in the question
+            prefs = get_user_prefs(aad_id)
+            logger.info(f"Loaded prefs for {aad_id}: {prefs}")
+            if not state.get("pending_pref"):
+                if "dept" not in prefs:
+                    vals = extract_depts(question)
+                    if vals:
+                        # normalize the key before saving
+                        key = KEY_NORMALIZATION.get("dept", "dept")
+                        valid, invalid = validate_pref(key, vals)
+                        if not valid:
+                            await turn_context.send_activity(
+                                f"⚠️ I didn’t recognize dept(s): {', '.join(invalid)}. "
+                                f"Valid values are: {', '.join(sorted(VALID_DEPTS))}."
+                            )
+                        else:
+                            state["pending_pref"] = {"key": key, "value": valid}
+                            if invalid:
+                                await turn_context.send_activity(
+                                    f"⚠️ Ignoring invalid dept(s): {', '.join(invalid)}. "
+                                    f"Proceeding with valid dept(s): {', '.join(valid)}.\n"
+                                    f"(Reply `yes` or `no` to confirm.)"
+                                )
+                            else:
+                                await turn_context.send_activity(
+                                    f"💡 I noticed you mentioned dept(s) {', '.join(valid)} in this query. "
+                                    f"Want me to remember {', '.join(valid)} as your default dept(s)?\n"
+                                    f"(Reply `yes` or `no` to confirm.)"
+                                )
+
+            if "dc" not in prefs:
+                vals = extract_dcs(question)
+                if vals:
+                    key = KEY_NORMALIZATION.get("dc", "dc")
+                    valid, invalid = validate_pref(key, vals)
+                    if not valid:
+                        await turn_context.send_activity(
+                            f"⚠️ I didn’t recognize DC(s): {', '.join(invalid)}. "
+                            f"Valid values are: {', '.join(sorted(VALID_DCS))}."
+                        )
+                    else:
+                        state["pending_pref"] = {"key": key, "value": valid}
+                        if invalid:
+                            await turn_context.send_activity(
+                                f"⚠️ Ignoring invalid DC(s): {', '.join(invalid)}. "
+                                f"Proceeding with valid DC(s): {', '.join(valid)}.\n"
+                                f"(Reply `yes` or `no` to confirm.)"
+                            )
+                        else:
+                            await turn_context.send_activity(
+                                f"💡 I noticed you mentioned DC(s) {', '.join(valid)} in this query. "
+                                f"Want me to remember {', '.join(valid)} as your default DC(s)?\n"
+                                f"(Reply `yes` or `no` to confirm.)"
+                            )
+
+                if "region" not in prefs:
+                    vals = extract_regions(question)
+                    if vals:
+                        key = KEY_NORMALIZATION.get("region", "region")
+                        valid, invalid = validate_pref(key, vals)
+                        if not valid:
+                            await turn_context.send_activity(
+                                f"⚠️ I didn’t recognize region(s): {', '.join(invalid)}. "
+                                f"Valid values are: {', '.join(sorted(VALID_REGIONS))}."
+                            )
+                        else:
+                            state["pending_pref"] = {"key": key, "value": valid}
+                            if invalid:
+                                await turn_context.send_activity(
+                                    f"⚠️ Ignoring invalid region(s): {', '.join(invalid)}. "
+                                    f"Proceeding with valid region(s): {', '.join(valid)}.\n"
+                                    f"(Reply `yes` or `no` to confirm.)"
+                                )
+                            else:
+                                await turn_context.send_activity(
+                                    f"💡 I noticed you mentioned region(s) {', '.join(valid)} in this query. "
+                                    f"Want me to remember {', '.join(valid)} as your default region(s)?\n"
+                                    f"(Reply `yes` or `no` to confirm.)"
+                                )
 
             # safely add user info without affecting Genie response
             aad_id = getattr(turn_context.activity.from_property, "aad_object_id", None)
@@ -1143,12 +1445,12 @@ async def _create_draft_for_session(user_id: str, session: str) -> web.Response:
         logger.info("Reusing recent draft for %s", key)
         web_link = cached["web_link"]
         html = f"""<!doctype html>
-<html><head><meta charset="utf-8"></head>
-<body style="font-family:Segoe UI, Arial; margin:16px">
-  <h3>Draft created</h3>
-  <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
-  <p>You can also find it in your Drafts folder in desktop Outlook.</p>
-</body></html>"""
+        <html><head><meta charset="utf-8"></head>
+        <body style="font-family:Segoe UI, Arial; margin:16px">
+        <h3>Draft created</h3>
+        <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
+        <p>You can also find it in your Drafts folder in desktop Outlook.</p>
+        </body></html>"""
         return web.Response(text=html, content_type="text/html")
 
     # Ensure only one creator runs for this key at a time
@@ -1160,12 +1462,12 @@ async def _create_draft_for_session(user_id: str, session: str) -> web.Response:
             logger.info("Reusing recent draft for %s (post-lock)", key)
             web_link = cached["web_link"]
             html = f"""<!doctype html>
-<html><head><meta charset="utf-8"></head>
-<body style="font-family:Segoe UI, Arial; margin:16px">
-  <h3>Draft created</h3>
-  <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
-  <p>You can also find it in your Drafts folder in desktop Outlook.</p>
-</body></html>"""
+            <html><head><meta charset="utf-8"></head>
+            <body style="font-family:Segoe UI, Arial; margin:16px">
+            <h3>Draft created</h3>
+            <p><a href="{web_link}" target="_blank" rel="noopener">Open draft in Outlook (web)</a></p>
+            <p>You can also find it in your Drafts folder in desktop Outlook.</p>
+            </body></html>"""
             return web.Response(text=html, content_type="text/html")
 
                 # ----- Supervisor (LLM) -----
@@ -1229,27 +1531,6 @@ async def _create_draft_for_session(user_id: str, session: str) -> web.Response:
                     logger.warning("CSV path missing for session %s; skipping attachment", session)
 
             DRAFTS_BY_KEY[key] = {"msg_id": msg_id, "web_link": web_link, "ts": time.time()}
-
-        # # Build subject + bodies; attach CSV only when preview omitted
-        # plain_body, html_body, included_preview = build_email_bodies(data)
-        # subject = build_business_subject(data)
-
-        # try:
-        #     draft = create_draft_via_graph(access_token, subject, html_body)
-        #     msg_id   = draft.get("id")
-        #     web_link = draft.get("webLink")
-
-        #     if not included_preview:
-        #         csv_path = SESSION_FILES.get(session)
-        #         if csv_path and os.path.exists(csv_path):
-        #             with open(csv_path, "rb") as f:
-        #                 csv_bytes = f.read()
-        #             _ = attach_csv_via_graph(access_token, msg_id, csv_bytes, os.path.basename(csv_path))
-        #         else:
-        #             logger.warning("CSV path missing for session %s; skipping attachment", session)
-
-        #     # Cache the result to prevent duplicate drafts for a short window
-        #     DRAFTS_BY_KEY[key] = {"msg_id": msg_id, "web_link": web_link, "ts": time.time()}
 
         except Exception:
             logger.exception("Failed to create draft or attach CSV via Graph")
