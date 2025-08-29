@@ -134,6 +134,7 @@ Dataset References:
 - For container, FEU, TEU, shipments → use table: inbound_otw_report_20250721
 - For orders → use table: inbound_po_supply_chain_20250721
 - For receipts or received orders → use table: inbound_otw_report_20250721
+- Apply all rules above when interpreting the request and generating SQL.
 """
 
 # logger.info(
