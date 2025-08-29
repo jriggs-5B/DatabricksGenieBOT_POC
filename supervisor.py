@@ -237,3 +237,72 @@ def supervisor_summarize(answer_json: Dict[str, Any]) -> Dict[str, str]:
     except Exception as e:
         logger.exception("LLM supervisor failed; using no-op overrides. Error: %s", e)
         return _empty_overrides()
+    
+
+def supervisor_insights(answer_json: dict) -> dict:
+    """
+    Generate business insights from Genie results.
+    Accepts the full answer_json for flexibility.
+    Returns { "insights_html": str, "insights_text": str }
+    """
+    try:
+        # Try the "direct" fields first (if process_query_results or other code sets them)
+        data_sample = answer_json.get("data_array")
+        schema = answer_json.get("schema")
+
+        # Otherwise drill into the Genie shape
+        if not data_sample:
+            data_sample = (
+                answer_json.get("statement_response", {})
+                .get("result", {})
+                .get("data_array", [])
+            )
+        if not schema:
+            schema = (
+                answer_json.get("statement_response", {})
+                .get("manifest", {})
+                .get("schema", {})
+                .get("columns", [])
+            )
+
+        if not data_sample or not schema:
+            return {"insights_html": "", "insights_text": ""}
+
+        prompt = f"""
+        You are an experienced retail supply chain analyst. Your audience is inventory planners, buyers, supply chain analysts, 
+        and merchandise operations analysts who use this tool to locate product in the supply chain and determine where there 
+        are potential issues.
+
+        Your task is to review the provided data and generate 2–4 concise, high-value insights that go beyond description:
+        - Identify potential supply chain risks, delays, shortages, or imbalances.
+        - Highlight notable contributors (e.g., top vendors, DCs, SKUs, origins) driving issues or concentration of volume.
+        - Suggest practical next steps, possible root causes, or follow-up questions to explore.
+
+        Data schema: {schema}
+        Data sample (first 20 rows max): {data_sample[:20]}
+
+        Guidelines:
+        - Use bullet points.
+        - Business-friendly, plain English.
+        - Each point should either highlight a potential issue OR propose a potential action/question.
+        - Keep strictly grounded in the data provided (no assumptions or hallucinations).
+        - Do not include PII.
+        """
+        resp = _client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": "You generate business insights for retail supply chain data."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=250,
+        )
+
+        text_out = resp.choices[0].message.content.strip()
+        html_out = "<ul>" + "".join(
+            [f"<li>{line.strip()}</li>" for line in text_out.split("\n") if line.strip()]
+        ) + "</ul>"
+
+        return {"insights_html": html_out, "insights_text": text_out}
+
+    except Exception as e:
+        return {"insights_html": "", "insights_text": f"[Supervisor error: {e}]"}

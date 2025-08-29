@@ -14,6 +14,7 @@ botframework-connector==4.17.0
 
 # Data handling
 pandas==2.3.1
+azure-data-tables
 
 # Databricks SDK
 databricks-SDK==0.59.0
