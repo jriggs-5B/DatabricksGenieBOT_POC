@@ -36,7 +36,7 @@ from urllib.parse import urlencode, quote
 from contextlib import suppress
 import sqlparse
 from supervisor import supervisor_summarize, supervisor_insights
-from storage import save_user_profile, save_user_pref, get_user_prefs
+from storage import save_user_profile, save_user_pref, get_user_prefs, clear_user_pref
 
 # Env vars
 load_dotenv()
@@ -71,6 +71,8 @@ LLM_SUPERVISOR_INSIGHTS_ENABLED = os.getenv("LLM_SUPERVISOR_INSIGHTS_ENABLED", "
 EXPLICIT_INTENT = re.compile(
     r"\b(remember|set|save|store|make\s+(?:it\s+)?(?:my\s+)?default|default\s+to|prefer|use)\b",
     re.IGNORECASE,)
+CLEAR_INTENT = re.compile(r"\b(clear|forget|delete|reset)\b", re.IGNORECASE)
+
 VALID_DEPTS =   {"32", "41", "42", "44", "45", "46",
                 "51", "52", "53", "55", "61", "63",
                 "64", "66", "67", "82", "83", "84",
@@ -818,10 +820,13 @@ async def maybe_handle_pref_command(turn_context, aad_id: str, question: str) ->
 
             # Split multiple values on commas or "and"
             if key in ("dept", "dc"):
-                values = re.split(r"[,\sand]+", raw_value)
+                # numeric lists (comma or "and")
+                values = re.split(r"\s*(?:,|and)\s*", raw_value)
                 values = [v.strip() for v in values if v.strip().isdigit()]
             else:  # region
-                values = [v.strip() for v in re.split(r"[,\sand]+", raw_value) if v.strip()]
+                # region names: allow multi-word tokens like "great lakes"
+                values = re.split(r"\s*(?:,|and)\s*", raw_value)
+                values = [v.strip().upper() for v in values if v.strip()]
 
             if not values:
                 continue  # nothing valid parsed
@@ -851,10 +856,73 @@ async def maybe_handle_pref_command(turn_context, aad_id: str, question: str) ->
             if invalid:
                 msg = f"⚠️ Ignoring invalid {key}(s): {', '.join(invalid)}. " + msg
 
-            await turn_context.send_activity(f"{msg} (Current prefs: {prefs})")
+            
+            # Natural summary of all prefs (only if there are others to show)
+            remaining = []
+            for k, v in prefs.items():
+                if isinstance(v, list):
+                    remaining.append(f"{k} = [{', '.join(v)}]")
+                else:
+                    remaining.append(f"{k} = {v}")
+
+            if remaining:
+                msg += f" Current saved preferences: {', '.join(remaining)}."
+
+            await turn_context.send_activity(msg)
             return True
 
     return False
+
+async def maybe_handle_clear_command(turn_context, aad_id: str, question: str) -> bool:
+    """
+    Handle explicit commands like 'clear my dept', 'forget region', 'reset all'.
+    Returns True if handled, False otherwise.
+    """
+    if not CLEAR_INTENT.search(question):
+        return False
+
+    text = question.lower()
+    prefs = None
+    cleared_key = None
+    message = ""
+
+    if "dept" in text or "department" in text:
+        prefs = clear_user_pref(aad_id, "dept")
+        cleared_key = "dept"
+        message = "🗑️ Cleared your saved department preference(s)."
+    elif "dc" in text or "distribution center" in text:
+        prefs = clear_user_pref(aad_id, "dc")
+        cleared_key = "dc"
+        message = "🗑️ Cleared your saved distribution center preference(s)."
+    elif "region" in text:
+        prefs = clear_user_pref(aad_id, "region")
+        cleared_key = "region"
+        message = "🗑️ Cleared your saved region preference(s)."
+    elif "all" in text or "prefs" in text or "preferences" in text:
+        prefs = clear_user_pref(aad_id, None)
+        cleared_key = "all"
+        message = "🗑️ All saved preferences have been reset."
+    else:
+        return False
+
+    # Build a natural summary of what’s left
+    if prefs:
+        remaining = []
+        for k, v in prefs.items():
+            if isinstance(v, list):
+                remaining.append(f"{k} = [{', '.join(v)}]")
+            else:
+                remaining.append(f"{k} = {v}")
+        if remaining:
+            message += f" Current saved preferences: {', '.join(remaining)}."
+        else:
+            message += " You now have no saved preferences."
+    else:
+        message += " You now have no saved preferences."
+
+    await turn_context.send_activity(message)
+    logger.info(f"User {aad_id} cleared {cleared_key} → remaining prefs {prefs}")
+    return True
 
 def extract_depts(question: str) -> list[str]:
     import re, logging
@@ -880,9 +948,9 @@ def extract_dcs(question: str) -> list[str]:
     return matches
 
 def extract_regions(question: str) -> list[str]:
-    # Match "region east", "region=west", "regional sales for north and south"
-    matches = re.findall(r"\bregion(?:al)?\s*(?:=)?\s*([a-zA-Z]+)", question, re.I)
-    return [m.capitalize() for m in matches]
+    # Match "region east", "region=west", "region great lakes"
+    matches = re.findall(r"\bregion(?:s)?\s*(?:=)?\s*([a-zA-Z\s]+)", question, re.I)
+    return [m.strip().upper() for m in matches]
 
 def validate_pref(key: str, values: list[str]) -> tuple[list[str], list[str]]:
     """
@@ -893,7 +961,7 @@ def validate_pref(key: str, values: list[str]) -> tuple[list[str], list[str]]:
     elif key == "dc":
         valid = [v for v in values if v in VALID_DCS]
     elif key == "region":
-        valid = [v.capitalize() for v in values if v.capitalize() in VALID_REGIONS]
+        valid = [v.upper() for v in values if v.upper() in VALID_REGIONS]
     else:
         return [], values
     invalid = [v for v in values if v not in valid]
@@ -1264,6 +1332,10 @@ class MyBot(ActivityHandler):
 
         if EXPLICIT_INTENT.search(question):
             if await maybe_handle_pref_command(turn_context, aad_id, question):
+                return  # handled; skip Genie for this turn
+            
+        if CLEAR_INTENT.search(question):
+            if await maybe_handle_clear_command(turn_context, aad_id, question):
                 return  # handled; skip Genie for this turn
 
         typing_task = asyncio.create_task(self._typing_pump(turn_context, interval=TYPING_INTERVAL))
