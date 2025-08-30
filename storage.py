@@ -136,3 +136,22 @@ def get_user_prefs(aad_id: str) -> dict:
         return prefs
     except Exception:
         return {}
+    
+def clear_user_pref(aad_id: str, key: str | None = None) -> dict:
+    """
+    Remove one preference (key) or all prefs for a user.
+    Returns the updated prefs dict.
+    """
+    table = _get_table()
+    entity = table.get_entity("UserPrefs", aad_id)
+    prefs = json.loads(entity.get("userPrefs", "{}"))
+
+    if key:
+        prefs.pop(key, None)
+    else:
+        prefs = {}  # wipe all
+
+    entity["userPrefs"] = json.dumps(prefs)
+    table.upsert_entity(entity)
+    logger.info(f"Cleared prefs for {aad_id}, key={key or 'ALL'} → {prefs}")
+    return prefs

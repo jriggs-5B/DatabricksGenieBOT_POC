@@ -34,10 +34,14 @@ Databricks Tables w/ supervisor agent - captures and stores user prefs
 container = 
 docker.io/jaspersj/poc-genie-web-app:DEV-stored-prefs
 
-CURRENT DEV DEPLOYMENT SLOT
 Databricks Tables w/ supervisor agent - insights and prefs merged for testing
 container = 
 docker.io/jaspersj/poc-genie-web-app:DEV-insights-prefs
+
+CURRENT DEV DEPLOYMENT SLOT
+Databricks Tables w/ supervisor agent - clear prefs feature
+container = 
+docker.io/jaspersj/poc-genie-web-app:DEV-clear-prefs
 
 Databricks Tables w/ supervisor agent email feature [STABLE BUILD]
 container = 
@@ -67,7 +71,7 @@ docker buildx build \
 az webapp config container set \
 --resource-group RG-Know-Dev \
 --name POC-genie-web-app \
---container-image-name jaspersj/poc-genie-web-app:PROD=Validate \
+--container-image-name jaspersj/poc-genie-web-app:PROD-Validate \
 --container-registry-url https://index.docker.io
 
 az webapp restart \
@@ -79,8 +83,7 @@ Dev Deployment Slot
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -f Dockerfile \
-  -t jaspersj/poc-genie-web-app:DEV-insights-prefs \
-
+  -t jaspersj/poc-genie-web-app:DEV-clear-prefs \
   --push \
   .
 
@@ -88,7 +91,7 @@ az webapp config container set \
   --resource-group RG-Know-Dev \
   --name POC-genie-web-app \
   --slot dev \
-  --container-image-name jaspersj/poc-genie-web-app:DEV-insights-prefs \
+  --container-image-name jaspersj/poc-genie-web-app:DEV-clear-prefs \
   --container-registry-url https://index.docker.io
 
 az webapp restart \
