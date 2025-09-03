@@ -136,6 +136,9 @@ Dataset References:
 - For container, FEU, TEU, shipments → use table: inbound_otw_report_20250721
 - For orders → use table: inbound_po_supply_chain_20250721
 - For receipts or received orders → use table: inbound_otw_report_20250721
+- For date and time details not present in fact tables → use dimension table: cal_dt_dim_poc
+- For item/product details not present in fact tables (like hierarchy and attributes) → use dimension table: item_hier_flatten_dim_genie
+- For location details not present in fact tables (like hierarchy and attributes) → use dimension table: loc_hier_flatten_dim_genie
 - Apply all rules above when interpreting the request and generating SQL.
 """
 
@@ -363,19 +366,88 @@ async def ask_genie(
         # Compose prompt with per-turn instructions
         composed_question = _compose_genie_prompt(question, aad_id)
 
-        if conversation_id is None:
-            initial_message = await loop.run_in_executor(
-                None, genie_api.start_conversation_and_wait, space_id, composed_question
-            )
-            conversation_id = initial_message.conversation_id
-        else:
-            initial_message = await loop.run_in_executor(
-                None,
-                genie_api.create_message_and_wait,
-                space_id, conversation_id, composed_question
-            )
+        logger.debug(f"[ask_genie] Sending composed prompt to Genie:\n{composed_question}")
 
-        message_id = initial_message.message_id
+        # if conversation_id is None:
+        #     initial_message = await loop.run_in_executor(
+        #         None, genie_api.start_conversation_and_wait, space_id, composed_question
+        #     )
+        #     conversation_id = initial_message.conversation_id
+        # else:
+        #     initial_message = await loop.run_in_executor(
+        #         None,
+        #         genie_api.create_message_and_wait,
+        #         space_id, conversation_id, composed_question
+        #     )
+
+        # message_id = initial_message.message_id
+
+        if conversation_id is None:
+            start_resp = await loop.run_in_executor(
+                None, genie_api.start_conversation, space_id, composed_question
+            )
+            conversation_id = getattr(start_resp, "conversation_id", None) or getattr(
+                getattr(start_resp, "conversation", None), "id", None
+            )
+            message_id = getattr(start_resp, "message_id", None) or getattr(
+                getattr(start_resp, "message", None), "id", None
+            )
+        else:
+            create_resp = await loop.run_in_executor(
+                None, genie_api.create_message, space_id, conversation_id, composed_question
+            )
+            # keep existing conversation_id; grab the new message id
+            message_id = getattr(create_resp, "message_id", None) or getattr(create_resp, "id", None)
+
+        logger.debug("[ask_genie] started conversation_id=%s, message_id=%s", conversation_id, message_id)
+        if not conversation_id or not message_id:
+            raise RuntimeError("Genie did not return conversation_id/message_id")
+
+        # --- manual poll to terminal state; also where you add raw REST/SQL logging if desired ---
+        backoff = 1.0
+        final_message = None
+        while True:
+            msg = await loop.run_in_executor(
+                None, genie_api.get_message, space_id, conversation_id, message_id
+            )
+            status = getattr(msg, "status", None)
+
+            # 🔎 Deep, unredacted logging when attachments exist (toggle-controlled)
+            if os.getenv("DEBUG_GENIE_LOGGING", "0") == "1" and getattr(msg, "attachments", None):
+                try:
+                    raw = genie_api.api_client.do(
+                        "GET",
+                        f"/api/2.0/genie/spaces/{space_id}/conversations/{conversation_id}/messages/{message_id}"
+                    )
+                    logger.debug("[ask_genie] RAW genie message payload:\n%s", json.dumps(raw, indent=2))
+
+                    # Best-effort: pull full SQL from the raw payload
+                    att = (raw.get("attachments") or [{}])[0]
+                    raw_sql = ((att.get("query") or {}).get("query"))
+                    if raw_sql:
+                        logger.debug("[ask_genie] RAW SQL (from REST):\n%s", raw_sql)
+
+                    # If Genie emitted a statement_id, also log the SQL Statements API view (often contains full text)
+                    stmt_id = ((att.get("query") or {}).get("statement_id")) or (raw.get("query_result") or {}).get("statement_id")
+                    if stmt_id:
+                        try:
+                            stmt_raw = genie_api.api_client.do("GET", f"/api/2.0/sql/statements/{stmt_id}")
+                            # Different shapes across warehouses; try common fields
+                            stmt_text = (stmt_raw.get("statement", {}) or {}).get("query") or stmt_raw.get("statement_text")
+                            if stmt_text:
+                                logger.debug("[ask_genie] SQL Statements API text:\n%s", stmt_text)
+                            if "error" in stmt_raw:
+                                logger.debug("[ask_genie] SQL Statements API error:\n%s", json.dumps(stmt_raw["error"], indent=2))
+                        except Exception as e:
+                            logger.warning("[ask_genie] fetch /sql/statements/%s failed: %s", stmt_id, e)
+                except Exception as e:
+                    logger.warning("[ask_genie] raw REST payload fetch failed: %s", e)
+
+            if status in {MessageStatus.COMPLETED, MessageStatus.FAILED}:
+                final_message = msg
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.5, 6.0)
 
         # ───────────────────────────────────────────────────────────────────────────
         # 2) poll for COMPLETED with exponential backoff
@@ -426,8 +498,9 @@ async def ask_genie(
                     raw_sql = getattr(query_obj, "query",      None)
 
                     if raw_sql:
-                        raw_sql = raw_sql.strip().rstrip(";")
-                        raw_sql_limited = f"{raw_sql} LIMIT {MAX_ROWS + 1}"  # ask for one extra row
+                        logger.debug(f"[ask_genie] Genie ORIGINAL raw SQL:\n{raw_sql}")
+                        raw_sql_clean = raw_sql.strip().rstrip(";")
+                        raw_sql_limited = f"{raw_sql_clean} LIMIT {MAX_ROWS + 1}"
                     else:
                         raw_sql_limited = raw_sql
 
